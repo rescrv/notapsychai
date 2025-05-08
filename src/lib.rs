@@ -468,7 +468,7 @@ It is a spectrum of POOR, FAIR, GOOD, GREAT, EXCELLENT.
     }
 }
 
-pub async fn do_it_all() {
+pub async fn notapsych() {
     let config = Config::builder()
         .auto_add_history(true)
         .edit_mode(EditMode::Vi)
