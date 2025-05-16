@@ -6,7 +6,8 @@ use rustyline::config::EditMode;
 use rustyline::error::ReadlineError;
 use rustyline::hint::HistoryHinter;
 use rustyline::{CompletionType, Config, Editor, EventHandler, KeyEvent};
-use yammer::{GenerateRequest, GenerateResponse, Spinner};
+
+pub mod stayfocused;
 
 mod cli;
 
@@ -18,6 +19,7 @@ const QUALITY_OF_SLEEP: &str = "quality-of-sleep";
 const MEDICATION: &str = "medication";
 const HYGIENE: &str = "hygiene";
 
+/*
 /////////////////////////////////////////////// Error //////////////////////////////////////////////
 
 #[derive(Debug)]
@@ -203,7 +205,7 @@ impl<HELPER: rustyline::Helper, HISTORY: rustyline::history::History> NotAPsych<
         }
         let mut failures = 0;
         loop {
-            let answer: MedicationAnswer = match self.question_and_answer(MEDICATION, 
+            let answer: MedicationAnswer = match self.question_and_answer(MEDICATION,
                     "List every medication you took since last checkin, and the dosage, e.g. \"30mg magic pill 3x daily.\"
 List caffeine, nicotine, and other substances as appropriate.
 Enter an empty line to continue: ").await {
@@ -547,3 +549,4 @@ pub enum Dose {
         times_daily: f64,
     },
 }
+*/
