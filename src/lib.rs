@@ -1,24 +1,3 @@
-use std::fs::OpenOptions;
-use std::io::Write;
-
-use chrono::Local;
-use rustyline::config::EditMode;
-use rustyline::error::ReadlineError;
-use rustyline::hint::HistoryHinter;
-use rustyline::{CompletionType, Config, Editor, EventHandler, KeyEvent};
-
-pub mod stayfocused;
-
-mod cli;
-
-use cli::{CommandHint, ShellHelper, TabEventHandler};
-
-const LAST_SLEPT: &str = "last-slept";
-const SLEPT_HOW_LONG: &str = "slept-how-long";
-const QUALITY_OF_SLEEP: &str = "quality-of-sleep";
-const MEDICATION: &str = "medication";
-const HYGIENE: &str = "hygiene";
-
 /*
 /////////////////////////////////////////////// Error //////////////////////////////////////////////
 
