@@ -1,1 +1,13 @@
 /target
+/testdata/
+/test_complex_mixed_schedule/
+/test_convergence_test/
+/test_delinquent_test/
+/test_schedule_daily_rhythm/
+/test_schedule_every_n_days_rhythm/
+/test_schedule_monthly_rhythm/
+/test_schedule_weekly_rhythm/
+/test_schedule_with_defer_event/
+/test_schedule_with_done_event/
+/test_schedule_with_slider/
+/test_schedule_with_spoons/
