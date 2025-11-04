@@ -11,8 +11,6 @@ repository = "https://github.com/rescrv/notapsychai"
 arrrg = "0.7.0"
 arrrg_derive = "0.7.0"
 chrono = { version = "0.4.39", features = ["clock"] }
-claudius = { version = "0.6.0", path = "../claudius" }
-claudius-derive = { version = "0.2.0", path = "../claudius/derive" }
 futures = "0.3.31"
 getopts = "0.2.21"
 reqwest = "0.12.12"
