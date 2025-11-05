@@ -1,0 +1,18 @@
+name: Docker Image CI
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build the Docker image (migrate up)
+      run: docker build . --target cadence-migrate-up
+    - name: Build the Docker image (serve)
+      run: docker build . --target cadence-serve
