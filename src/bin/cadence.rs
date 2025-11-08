@@ -45,7 +45,7 @@ struct AddOptions {
     #[arrrg(optional, "Day of month (0-30) for monthly")]
     dotm: Option<String>,
     #[arrrg(optional, "Number of days for every-n-days")]
-    n: Option<String>,
+    num_days: Option<String>,
     #[arrrg(optional, "Slider before,after (e.g., 1,2)")]
     slider: Option<String>,
 }
@@ -83,7 +83,7 @@ struct UpdateOptions {
     #[arrrg(optional, "Day of month (0-30) for monthly")]
     dotm: Option<String>,
     #[arrrg(optional, "Number of days for every-n-days")]
-    n: Option<String>,
+    num_days: Option<String>,
     #[arrrg(optional, "Slider before,after (e.g., 1,2)")]
     slider: Option<String>,
     #[arrrg(flag, "Use interactive mode")]
@@ -531,7 +531,7 @@ async fn cmd_add(config: &Config, args: &[String]) -> Result<(), Box<dyn std::er
         }
         "every-n-days" => {
             let n = opts
-                .n
+                .num_days
                 .map(|s| s.parse::<u32>())
                 .transpose()?
                 .map(Ok)
@@ -675,7 +675,7 @@ async fn cmd_update(config: &Config, args: &[String]) -> Result<(), Box<dyn std:
             && opts.slider.is_none()
             && opts.day.is_none()
             && opts.dotm.is_none()
-            && opts.n.is_none())
+            && opts.num_days.is_none())
     {
         println!("Current rhythm:");
         println!("  Description: {}", current.description);
@@ -782,7 +782,10 @@ async fn cmd_update(config: &Config, args: &[String]) -> Result<(), Box<dyn std:
                     }
                 }
                 "every-n-days" => {
-                    let n = opts.n.ok_or("--n required for every-n-days")?.parse()?;
+                    let n = opts
+                        .num_days
+                        .ok_or("--num-days required for every-n-days")?
+                        .parse()?;
                     if n == 0 {
                         return Err("Number of days must be greater than 0".into());
                     }
