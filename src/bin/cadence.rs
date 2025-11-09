@@ -2,7 +2,7 @@ use std::io::{self, Write as IoWrite};
 use std::str::FromStr;
 
 use arrrg::CommandLine;
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{NaiveDate, NaiveTime};
 use chrono_tz::Tz;
 use notapsychai::api_types::{
     ConvergenceResponse, CreateRhythmRequest, DeferRequest, DelinquentItem, LoginRequest,
@@ -946,41 +946,54 @@ async fn cmd_today(config: &Config, args: &[String]) -> Result<(), Box<dyn std::
     let token = config.require_auth()?;
     let user_tz = get_user_timezone(config).await?;
 
-    let now = Utc::now().with_timezone(&user_tz);
-    let today = now.date_naive();
-
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("{}/schedule", config.server_url))
+        .get(format!("{}/today", config.server_url))
         .bearer_auth(token)
-        .query(&[("start", today.to_string()), ("days", "90".to_string())])
         .send()
         .await?;
 
-    let response = check_response_success(response, "Get schedule").await?;
+    let response = check_response_success(response, "Get today's schedule").await?;
     let items: Vec<ScheduleItem> = response.json().await?;
 
-    let today_items: Vec<_> = items
-        .into_iter()
-        .filter(|item| {
-            let local_time = item.datetime.with_timezone(&user_tz);
-            local_time.date_naive() == today
-        })
-        .collect();
-
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&today_items)?);
-    } else if today_items.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else if items.is_empty() {
         println!("No scheduled items for today.");
     } else {
-        for item in today_items {
-            let local_time = item.datetime.with_timezone(&user_tz);
-            println!(
-                "{} - {} [{}]",
-                local_time.format("%H:%M:%S"),
-                item.description,
-                item.rhythm_id
-            );
+        let regular_items: Vec<_> = items.iter().filter(|item| !item.stretch_goal).collect();
+        let stretch_items: Vec<_> = items.iter().filter(|item| item.stretch_goal).collect();
+
+        if !regular_items.is_empty() {
+            for item in &regular_items {
+                let local_time = item.datetime.with_timezone(&user_tz);
+                println!(
+                    "{} - {} [{}]",
+                    local_time.format("%H:%M:%S"),
+                    item.description,
+                    item.rhythm_id
+                );
+            }
+        }
+
+        if !stretch_items.is_empty() {
+            if !regular_items.is_empty() {
+                println!();
+            }
+            println!("Stretch goals:");
+            for item in &stretch_items {
+                let local_time = item.datetime.with_timezone(&user_tz);
+                println!(
+                    "{} - {} [{}]",
+                    local_time.format("%H:%M:%S"),
+                    item.description,
+                    item.rhythm_id
+                );
+            }
+        }
+
+        if regular_items.is_empty() && stretch_items.is_empty() {
+            println!("No scheduled items for today.");
         }
     }
 

@@ -538,13 +538,23 @@ impl RhythmManager {
         start: NaiveDate,
         limit: NaiveDate,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
-        self.schedule_internal(start, limit, &mut HashMap::new())
+        self.schedule_with_capacity_adjustment(start, limit, false)
+    }
+
+    pub fn schedule_with_capacity_adjustment(
+        &self,
+        start: NaiveDate,
+        limit: NaiveDate,
+        adjust_today_capacity: bool,
+    ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
+        self.schedule_internal(start, limit, adjust_today_capacity, &mut HashMap::new())
     }
 
     fn schedule_internal(
         &self,
         start: NaiveDate,
         limit: NaiveDate,
+        adjust_today_capacity: bool,
         watermarks: &mut HashMap<NaiveDate, usize>,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
         let mut events_by_rhythm: HashMap<RhythmID, Vec<&EventRecord>> = HashMap::new();
@@ -554,6 +564,20 @@ impl RhythmManager {
                 .or_default()
                 .push(event);
         }
+
+        let today = self.now().date_naive();
+        let today_done_deferred_count = if adjust_today_capacity {
+            self.events
+                .iter()
+                .filter(|e| {
+                    let event_date_in_tz = e.when.with_timezone(&self.tz).date_naive();
+                    event_date_in_tz == today
+                        && (e.event_type == EventType::Done || e.event_type == EventType::Defer)
+                })
+                .count()
+        } else {
+            0
+        };
 
         let mut schedule: HashMap<NaiveDate, Vec<(DateTime<Tz>, RhythmDefinition)>> =
             HashMap::new();
@@ -666,6 +690,12 @@ impl RhythmManager {
             let slots_per_day =
                 ((slots_per_day as f64) * 2_f64.powf(spoons_adjusted as f64 / 5.0)).ceil() as usize;
 
+            let slots_per_day = if entry.when.date_naive() == today && adjust_today_capacity {
+                slots_per_day.saturating_sub(today_done_deferred_count)
+            } else {
+                slots_per_day
+            };
+
             let slots = schedule.entry(entry.when.date_naive()).or_default();
 
             let defer_today = self.events.iter().any(|e| {
@@ -705,6 +735,7 @@ impl RhythmManager {
                 } else if let Some(next) = entry.smoothing.shift_one() {
                     next
                 } else {
+                    // TODO(rescrv):  Make this an explicit error.
                     continue;
                 };
 
@@ -731,6 +762,11 @@ impl RhythmManager {
                     }
                 }
 
+                if adjust_today_capacity {
+                    let wm = watermarks.entry(entry.when.date_naive()).or_default();
+                    *wm += today_done_deferred_count;
+                }
+
                 let low_water_mark = low_water_mark.unwrap_or(0) + 1;
 
                 for date in options {
@@ -738,7 +774,7 @@ impl RhythmManager {
                     watermarks.insert(date, current.max(low_water_mark));
                 }
 
-                return self.schedule_internal(start, limit, watermarks);
+                return self.schedule_internal(start, limit, adjust_today_capacity, watermarks);
             }
         }
         let mut result = schedule.values().flatten().cloned().collect::<Vec<_>>();
@@ -1731,5 +1767,162 @@ mod tests {
             }
         }
         assert!(every5_found);
+    }
+
+    #[test]
+    fn capacity_adjustment_with_done_and_deferred() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let rhythm1 = create_test_rhythm(
+            "rhythm1_capacity",
+            Rhythm::EveryNDays {
+                n: 2,
+                at: TEST_AT,
+                slider: Slider::new(1, 1),
+            },
+        );
+        let rhythm2 = create_test_rhythm(
+            "rhythm2_capacity",
+            Rhythm::EveryNDays {
+                n: 3,
+                at: TEST_AT,
+                slider: Slider::new(1, 1),
+            },
+        );
+
+        manager.set_rhythm(rhythm1.clone()).unwrap();
+        manager.set_rhythm(rhythm2.clone()).unwrap();
+
+        let today = manager.now().date_naive();
+
+        manager.events.push(EventRecord {
+            rhythm_id: rhythm1.id,
+            event_type: EventType::Done,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+
+        let schedule_without_adjustment =
+            manager.schedule(today, today + chrono::Duration::days(10));
+
+        let schedule_with_adjustment = manager.schedule_with_capacity_adjustment(
+            today,
+            today + chrono::Duration::days(10),
+            true,
+        );
+
+        let today_count_without = schedule_without_adjustment
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+        let today_count_with = schedule_with_adjustment
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+
+        println!("Today count without adjustment: {today_count_without}");
+        println!("Today count with adjustment: {today_count_with}");
+        println!(
+            "Schedule without adjustment: {:?}",
+            schedule_without_adjustment
+                .iter()
+                .map(|(dt, r)| (dt.date_naive(), &r.description))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "Schedule with adjustment: {:?}",
+            schedule_with_adjustment
+                .iter()
+                .map(|(dt, r)| (dt.date_naive(), &r.description))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            today_count_with < today_count_without
+                || (today_count_without == 0 && today_count_with == 0),
+            "With adjustment, today should have fewer or equal tasks. Without: {today_count_without}, With: {today_count_with}"
+        );
+    }
+
+    #[test]
+    fn stretch_goals_identification() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let rhythm1 = create_test_rhythm(
+            "rhythm1_stretch",
+            Rhythm::EveryNDays {
+                n: 2,
+                at: TEST_AT,
+                slider: Slider::new(1, 1),
+            },
+        );
+        let rhythm2 = create_test_rhythm(
+            "rhythm2_stretch",
+            Rhythm::EveryNDays {
+                n: 3,
+                at: TEST_AT,
+                slider: Slider::new(1, 1),
+            },
+        );
+        let rhythm3 = create_test_rhythm(
+            "rhythm3_stretch",
+            Rhythm::EveryNDays {
+                n: 4,
+                at: TEST_AT,
+                slider: Slider::new(1, 1),
+            },
+        );
+
+        manager.set_rhythm(rhythm1.clone()).unwrap();
+        manager.set_rhythm(rhythm2.clone()).unwrap();
+        manager.set_rhythm(rhythm3.clone()).unwrap();
+
+        let today = manager.now().date_naive();
+        manager.events.push(EventRecord {
+            rhythm_id: rhythm1.id,
+            event_type: EventType::Done,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+
+        let limit = today + chrono::Duration::days(90);
+
+        let schedule_without_adjustment = manager.schedule(today, limit);
+        let schedule_with_adjustment =
+            manager.schedule_with_capacity_adjustment(today, limit, true);
+
+        let today_without: Vec<_> = schedule_without_adjustment
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .collect();
+        let today_with: Vec<_> = schedule_with_adjustment
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .collect();
+
+        println!("Today without adjustment: {}", today_without.len());
+        println!("Today with adjustment: {}", today_with.len());
+
+        assert!(
+            today_without.len() >= today_with.len(),
+            "Schedule without adjustment should have more or equal tasks for today"
+        );
+
+        let with_ids: std::collections::HashSet<_> =
+            today_with.iter().map(|(_, rhythm)| rhythm.id).collect();
+
+        let stretch_goals: Vec<_> = today_without
+            .iter()
+            .filter(|(_, rhythm)| !with_ids.contains(&rhythm.id))
+            .collect();
+
+        println!("Stretch goals: {}", stretch_goals.len());
+
+        if today_without.len() > today_with.len() {
+            assert!(
+                !stretch_goals.is_empty(),
+                "There should be stretch goals when schedules differ"
+            );
+        }
     }
 }
