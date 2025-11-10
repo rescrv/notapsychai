@@ -570,8 +570,9 @@ impl RhythmManager {
             self.events
                 .iter()
                 .filter(|e| {
-                    let event_date_in_tz = e.when.with_timezone(&self.tz).date_naive();
-                    event_date_in_tz == today
+                    e.local_time()
+                        .map(|dt| dt.date_naive() == today)
+                        .unwrap_or(false)
                         && (e.event_type == EventType::Done || e.event_type == EventType::Defer)
                 })
                 .count()
@@ -592,7 +593,9 @@ impl RhythmManager {
                         .get(&rhythm.id)
                         .map(|events| {
                             events.iter().any(|e| {
-                                e.when.date_naive() == day
+                                e.local_time()
+                                    .map(|dt| dt.date_naive() == day)
+                                    .unwrap_or(false)
                                     && (e.event_type == EventType::Done
                                         || e.event_type == EventType::Defer)
                             })
@@ -635,7 +638,7 @@ impl RhythmManager {
                     events
                         .iter()
                         .filter(|e| e.event_type == EventType::Defer)
-                        .map(|e| e.when.date_naive())
+                        .filter_map(|e| e.local_time().ok().map(|dt| dt.date_naive()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -701,7 +704,9 @@ impl RhythmManager {
             let defer_today = self.events.iter().any(|e| {
                 e.rhythm_id == entry.rhythm_id
                     && e.event_type == EventType::Defer
-                    && e.when.date_naive() == entry.when.date_naive()
+                    && e.local_time()
+                        .map(|dt| dt.date_naive() == entry.when.date_naive())
+                        .unwrap_or(false)
             });
 
             if !defer_today && slots.len() < slots_per_day {
@@ -1924,5 +1929,186 @@ mod tests {
                 "There should be stretch goals when schedules differ"
             );
         }
+    }
+
+    #[test]
+    fn timezone_boundary_done_defer_count() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let daily = create_test_rhythm("tz_daily", Rhythm::Daily { at: TEST_AT });
+        manager.set_rhythm(daily.clone()).unwrap();
+
+        let la_date = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+        let la_time = NaiveTime::from_hms_opt(23, 30, 0).unwrap();
+        let la_datetime = la_date
+            .and_time(la_time)
+            .and_local_timezone(Los_Angeles)
+            .earliest()
+            .unwrap();
+
+        manager.events.push(EventRecord {
+            rhythm_id: daily.id,
+            event_type: EventType::Done,
+            when: la_datetime.with_timezone(&Utc),
+            when_tz: "America/Los_Angeles".to_string(),
+        });
+
+        let schedule_vec = manager.schedule_with_capacity_adjustment(
+            la_date,
+            la_date + chrono::Duration::days(2),
+            true,
+        );
+        let schedule = group_schedule_by_date(schedule_vec);
+
+        let empty_vec = Vec::new();
+        let today_rhythms = schedule.get(&la_date).unwrap_or(&empty_vec);
+        assert_eq!(
+            today_rhythms.len(),
+            0,
+            "Event at 11:30 PM LA time should count as done on LA date, not UTC date"
+        );
+
+        let next_day = la_date + chrono::Duration::days(1);
+        let next_day_rhythms = schedule.get(&next_day).unwrap_or(&empty_vec);
+        assert!(
+            next_day_rhythms.iter().any(|r| r.id == daily.id),
+            "Daily rhythm should appear on next day"
+        );
+    }
+
+    #[test]
+    fn timezone_boundary_daily_scheduling() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let daily = create_test_rhythm("tz_daily2", Rhythm::Daily { at: TEST_AT });
+        manager.set_rhythm(daily.clone()).unwrap();
+
+        let la_date = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+        let la_time = NaiveTime::from_hms_opt(23, 45, 0).unwrap();
+        let la_datetime = la_date
+            .and_time(la_time)
+            .and_local_timezone(Los_Angeles)
+            .earliest()
+            .unwrap();
+
+        manager.events.push(EventRecord {
+            rhythm_id: daily.id,
+            event_type: EventType::Done,
+            when: la_datetime.with_timezone(&Utc),
+            when_tz: "America/Los_Angeles".to_string(),
+        });
+
+        let start = la_date;
+        let limit = la_date + chrono::Duration::days(3);
+        let schedule_vec = manager.schedule(start, limit);
+        let schedule = group_schedule_by_date(schedule_vec);
+
+        let empty_vec = Vec::new();
+        let done_day_rhythms = schedule.get(&la_date).unwrap_or(&empty_vec);
+        assert!(
+            !done_day_rhythms.iter().any(|r| r.id == daily.id),
+            "Daily should not appear on done day (Aug 20 LA time)"
+        );
+
+        let next_day = la_date + chrono::Duration::days(1);
+        let next_day_rhythms = schedule.get(&next_day).unwrap_or(&empty_vec);
+        assert!(
+            next_day_rhythms.iter().any(|r| r.id == daily.id),
+            "Daily should appear on Aug 21"
+        );
+    }
+
+    #[test]
+    fn timezone_boundary_defer_dates() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let weekly = create_test_rhythm(
+            "tz_weekly",
+            Rhythm::WeekDaily {
+                dotw: 6,
+                at: TEST_AT,
+                slider: Slider::new(1, 1),
+            },
+        );
+        manager.set_rhythm(weekly.clone()).unwrap();
+
+        let la_date = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+        let la_time = NaiveTime::from_hms_opt(23, 55, 0).unwrap();
+        let la_datetime = la_date
+            .and_time(la_time)
+            .and_local_timezone(Los_Angeles)
+            .earliest()
+            .unwrap();
+
+        manager.events.push(EventRecord {
+            rhythm_id: weekly.id,
+            event_type: EventType::Defer,
+            when: la_datetime.with_timezone(&Utc),
+            when_tz: "America/Los_Angeles".to_string(),
+        });
+
+        let start = la_date;
+        let limit = la_date + chrono::Duration::days(10);
+        let schedule_vec = manager.schedule(start, limit);
+        let schedule = group_schedule_by_date(schedule_vec);
+
+        let empty_vec = Vec::new();
+        let deferred_day_rhythms = schedule.get(&la_date).unwrap_or(&empty_vec);
+        assert!(
+            !deferred_day_rhythms.iter().any(|r| r.id == weekly.id),
+            "Weekly should not appear on deferred day (Aug 20 LA time, even though UTC is Aug 21)"
+        );
+
+        let day_before = la_date - chrono::Duration::days(1);
+        let day_after = la_date + chrono::Duration::days(1);
+
+        let appears_before = schedule
+            .get(&day_before)
+            .map(|rhythms| rhythms.iter().any(|r| r.id == weekly.id))
+            .unwrap_or(false);
+        let appears_after = schedule
+            .get(&day_after)
+            .map(|rhythms| rhythms.iter().any(|r| r.id == weekly.id))
+            .unwrap_or(false);
+
+        assert!(
+            appears_before || appears_after,
+            "Weekly should be rescheduled to adjacent day due to slider"
+        );
+    }
+
+    #[test]
+    fn timezone_early_morning_utc() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let daily = create_test_rhythm("tz_early", Rhythm::Daily { at: TEST_AT });
+        manager.set_rhythm(daily.clone()).unwrap();
+
+        let la_date = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+        let la_time = NaiveTime::from_hms_opt(2, 0, 0).unwrap();
+        let la_datetime = la_date
+            .and_time(la_time)
+            .and_local_timezone(Los_Angeles)
+            .earliest()
+            .unwrap();
+
+        manager.events.push(EventRecord {
+            rhythm_id: daily.id,
+            event_type: EventType::Done,
+            when: la_datetime.with_timezone(&Utc),
+            when_tz: "America/Los_Angeles".to_string(),
+        });
+
+        let start = la_date;
+        let limit = la_date + chrono::Duration::days(2);
+        let schedule_vec = manager.schedule(start, limit);
+        let schedule = group_schedule_by_date(schedule_vec);
+
+        let empty_vec = Vec::new();
+        let done_day_rhythms = schedule.get(&la_date).unwrap_or(&empty_vec);
+        assert!(
+            !done_day_rhythms.iter().any(|r| r.id == daily.id),
+            "Event at 2 AM LA time should be recognized as done on Aug 20 LA"
+        );
     }
 }
