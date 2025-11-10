@@ -81,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/rhythms/:id/done", post(mark_done))
         .route("/rhythms/:id/defer", post(defer_rhythm))
         .route("/schedule", get(get_schedule))
+        .route("/today", get(get_today))
         .route("/delinquent", get(get_delinquent))
         .route("/convergence", get(get_convergence))
         .route("/spoons", get(get_spoons).put(set_spoons))
@@ -391,6 +392,48 @@ async fn get_schedule(
             rhythm_id: rhythm_def.id.to_string(),
             description: rhythm_def.description,
             datetime: datetime.with_timezone(&Utc),
+            stretch_goal: false,
+        })
+        .collect();
+
+    Ok(Json(items))
+}
+
+async fn get_today(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ScheduleItem>>, AppError> {
+    let user_id = extract_user_from_headers(&headers, &state).await?;
+    let manager = db::load_rhythm_manager(&state.pool, user_id).await?;
+
+    let today = manager.now().date_naive();
+    let limit = today
+        .checked_add_days(chrono::Days::new(90))
+        .ok_or(AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Date overflow".to_string(),
+        ))?;
+
+    let schedule_without_adjustment = manager.schedule(today, limit);
+    let schedule_with_adjustment = manager.schedule_with_capacity_adjustment(today, limit, true);
+
+    let with_adjustment_ids: std::collections::HashSet<_> = schedule_with_adjustment
+        .iter()
+        .filter(|(dt, _)| dt.date_naive() == today)
+        .map(|(_, rhythm_def)| rhythm_def.id)
+        .collect();
+
+    let items: Vec<ScheduleItem> = schedule_without_adjustment
+        .into_iter()
+        .filter(|(dt, _)| dt.date_naive() == today)
+        .map(|(datetime, rhythm_def)| {
+            let stretch_goal = !with_adjustment_ids.contains(&rhythm_def.id);
+            ScheduleItem {
+                rhythm_id: rhythm_def.id.to_string(),
+                description: rhythm_def.description,
+                datetime: datetime.with_timezone(&Utc),
+                stretch_goal,
+            }
         })
         .collect();
 

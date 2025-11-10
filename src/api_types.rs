@@ -38,6 +38,7 @@ pub struct ScheduleItem {
     pub rhythm_id: String,
     pub description: String,
     pub datetime: DateTime<Utc>,
+    pub stretch_goal: bool,
 }
 
 #[derive(Serialize, Deserialize)]
