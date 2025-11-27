@@ -46,7 +46,7 @@ struct AddOptions {
     dotm: Option<String>,
     #[arrrg(optional, "Number of days for every-n-days")]
     num_days: Option<String>,
-    #[arrrg(optional, "Slider before,after (e.g., 1,2)")]
+    #[arrrg(optional, "Slider before,after (e.g., 1)")]
     slider: Option<String>,
 }
 
@@ -84,7 +84,7 @@ struct UpdateOptions {
     dotm: Option<String>,
     #[arrrg(optional, "Number of days for every-n-days")]
     num_days: Option<String>,
-    #[arrrg(optional, "Slider before,after (e.g., 1,2)")]
+    #[arrrg(optional, "Slider before,after (e.g., 1)")]
     slider: Option<String>,
     #[arrrg(flag, "Use interactive mode")]
     interactive: bool,
@@ -189,18 +189,12 @@ where
 
 fn prompt_slider() -> Result<Slider, Box<dyn std::error::Error>> {
     let before = prompt_number::<u32>("Slider before (days)")?;
-    let after = prompt_number::<u32>("Slider after (days)")?;
-    Ok(Slider::new(before, after))
+    Ok(Slider::new(before))
 }
 
 fn parse_slider(slider_str: &str) -> Result<Slider, Box<dyn std::error::Error>> {
-    let parts: Vec<&str> = slider_str.split(',').collect();
-    if parts.len() != 2 {
-        return Err("Slider must be in format 'before,after' (e.g. '1,2')".into());
-    }
-    let before = parts[0].parse::<u32>()?;
-    let after = parts[1].parse::<u32>()?;
-    Ok(Slider::new(before, after))
+    let before = slider_str.parse::<u32>()?;
+    Ok(Slider::new(before))
 }
 
 fn parse_time(time_str: &str) -> Result<NaiveTime, Box<dyn std::error::Error>> {

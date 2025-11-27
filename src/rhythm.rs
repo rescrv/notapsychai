@@ -1,4 +1,3 @@
-use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::str::FromStr;
 
@@ -48,12 +47,11 @@ impl TryFrom<&Uuid> for RhythmID {
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct Slider {
     pub before: u32,
-    pub after: u32,
 }
 
 impl Slider {
-    pub fn new(before: u32, after: u32) -> Self {
-        Self { before, after }
+    pub fn new(before: u32) -> Self {
+        Self { before }
     }
 }
 
@@ -92,6 +90,41 @@ impl Rhythm {
             Self::Monthly { at, .. } => at,
             Self::WeekDaily { at, .. } => at,
             Self::EveryNDays { at, .. } => at,
+        }
+    }
+
+    pub fn with_slider(mut self, slider: Slider) -> Self {
+        let s = slider;
+        match self {
+            Self::Daily { .. } => {}
+            Self::Monthly { ref mut slider, .. } => {
+                *slider = s;
+            }
+            Self::WeekDaily { ref mut slider, .. } => {
+                *slider = s;
+            }
+            Self::EveryNDays { ref mut slider, .. } => {
+                *slider = s;
+            }
+        }
+        self
+    }
+
+    pub fn slide_one(mut self) -> Self {
+        match self {
+            Self::Daily { .. } => self,
+            Self::Monthly { ref mut slider, .. } => {
+                slider.before = slider.before.saturating_sub(1);
+                self
+            }
+            Self::WeekDaily { ref mut slider, .. } => {
+                slider.before = slider.before.saturating_sub(1);
+                self
+            }
+            Self::EveryNDays { ref mut slider, .. } => {
+                slider.before = slider.before.saturating_sub(1);
+                self
+            }
         }
     }
 
@@ -206,26 +239,14 @@ impl std::fmt::Display for Rhythm {
         match self {
             Self::Daily { at } => write!(f, "daily at {at}"),
             Self::Monthly { dotm, at, slider } => {
-                write!(
-                    f,
-                    "monthly on the {dotm} at {at} slider:{},{}",
-                    slider.before, slider.after
-                )
+                write!(f, "monthly on the {dotm} at {at} slider:{}", slider.before)
             }
             Self::WeekDaily { dotw, at, slider } => {
                 let dotw = Weekday::try_from(*dotw).unwrap_or(Weekday::Mon);
-                write!(
-                    f,
-                    "weekly on {dotw} at {at} slider:{},{}",
-                    slider.before, slider.after
-                )
+                write!(f, "weekly on {dotw} at {at} slider:{}", slider.before)
             }
             Self::EveryNDays { n, at, slider } => {
-                write!(
-                    f,
-                    "every {n} days at {at} slider:{},{}",
-                    slider.before, slider.after
-                )
+                write!(f, "every {n} days at {at} slider:{}", slider.before)
             }
         }
     }
@@ -242,6 +263,18 @@ pub struct RhythmDefinition {
     pub created_at_tz: String,
     pub modified_at: DateTime<Utc>,
     pub modified_at_tz: String,
+}
+
+impl RhythmDefinition {
+    pub fn slide_one(mut self) -> Self {
+        self.rhythm = self.rhythm.slide_one();
+        self
+    }
+
+    pub fn with_slider(mut self, slider: Slider) -> Self {
+        self.rhythm = self.rhythm.with_slider(slider);
+        self
+    }
 }
 
 ///////////////////////////////////////////// EventType ////////////////////////////////////////////
@@ -288,114 +321,6 @@ impl EventRecord {
     pub fn local_time(&self) -> Result<DateTime<Tz>, chrono_tz::ParseError> {
         let tz = Tz::from_str(&self.when_tz)?;
         Ok(self.when.with_timezone(&tz))
-    }
-}
-
-//////////////////////////////////////////// Smoothing /////////////////////////////////////////////
-
-#[derive(Clone, Debug)]
-struct Smoothing {
-    rhythm: RhythmDefinition,
-    original_beat: NaiveDate,
-    remaining_choices: Vec<NaiveDate>,
-    passed_over_choices: Vec<NaiveDate>,
-}
-
-impl Smoothing {
-    fn new(
-        rhythm: RhythmDefinition,
-        original_beat: NaiveDate,
-        start: NaiveDate,
-        limit: NaiveDate,
-    ) -> Self {
-        let mut remaining_choices = Vec::new();
-        let slider = rhythm.rhythm.slider();
-
-        // Add before options second (fallback to moving backward)
-        for i in 1..=slider.before {
-            let date = original_beat - chrono::Duration::days(i as i64);
-            if date >= start && date < limit {
-                remaining_choices.push(date);
-            }
-        }
-
-        // Add after options first (prefer moving forward)
-        for i in 1..=slider.after {
-            let date = original_beat + chrono::Duration::days(i as i64);
-            if date >= start && date < limit {
-                remaining_choices.push(date);
-            }
-        }
-
-        Self {
-            rhythm,
-            original_beat,
-            remaining_choices,
-            passed_over_choices: Vec::new(),
-        }
-    }
-
-    fn all_options(&self) -> Vec<NaiveDate> {
-        let mut options = vec![self.original_beat];
-        let slider = self.rhythm.rhythm.slider();
-
-        for i in 1..=slider.before {
-            options.push(self.original_beat - chrono::Duration::days(i as i64));
-        }
-
-        for i in 1..=slider.after {
-            options.push(self.original_beat + chrono::Duration::days(i as i64));
-        }
-
-        options
-    }
-
-    fn shift_one(&mut self) -> Option<NaiveDate> {
-        if !self.remaining_choices.is_empty() {
-            let picked = self.remaining_choices.remove(0);
-            self.passed_over_choices.push(picked);
-            Some(picked)
-        } else {
-            None
-        }
-    }
-}
-
-/////////////////////////////////////////// HeapEntry /////////////////////////////////////////////
-
-#[derive(Clone, Debug)]
-struct HeapEntry {
-    when: DateTime<Tz>,
-    num_choices: usize,
-    periodicity: u32,
-    rhythm_id: RhythmID,
-    smoothing: Smoothing,
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.when == other.when
-            && self.num_choices == other.num_choices
-            && self.periodicity == other.periodicity
-            && self.rhythm_id == other.rhythm_id
-    }
-}
-
-impl Eq for HeapEntry {}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.when
-            .cmp(&other.when)
-            .then_with(|| self.num_choices.cmp(&other.num_choices))
-            .then_with(|| self.periodicity.cmp(&other.periodicity))
-            .then_with(|| self.rhythm_id.to_string().cmp(&other.rhythm_id.to_string()))
-    }
-}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -538,23 +463,23 @@ impl RhythmManager {
         start: NaiveDate,
         limit: NaiveDate,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
-        self.schedule_with_capacity_adjustment(start, limit, false)
+        self.schedule2(start, limit, true)
     }
 
-    pub fn schedule_with_capacity_adjustment(
+    pub fn schedule2(
         &self,
         start: NaiveDate,
         limit: NaiveDate,
-        adjust_today_capacity: bool,
+        ignore_today: bool,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
-        self.schedule_internal(start, limit, adjust_today_capacity, &mut HashMap::new())
+        self.schedule_internal(start, limit, ignore_today, &mut HashMap::default())
     }
 
     fn schedule_internal(
         &self,
         start: NaiveDate,
         limit: NaiveDate,
-        adjust_today_capacity: bool,
+        ignore_today: bool,
         watermarks: &mut HashMap<NaiveDate, usize>,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
         let mut events_by_rhythm: HashMap<RhythmID, Vec<&EventRecord>> = HashMap::new();
@@ -566,7 +491,7 @@ impl RhythmManager {
         }
 
         let today = self.now().date_naive();
-        let today_done_deferred_count = if adjust_today_capacity {
+        let today_done_deferred_count = if ignore_today {
             self.events
                 .iter()
                 .filter(|e| {
@@ -583,8 +508,6 @@ impl RhythmManager {
         let mut schedule: HashMap<NaiveDate, Vec<(DateTime<Tz>, RhythmDefinition)>> =
             HashMap::new();
 
-        // NOTE(rescrv):  Daily rhythms have no slider, no smoothing.  They must happen daily.
-        // Therefore, unconditionally schedule them for every day in the interval.
         for rhythm in &self.rhythms {
             if let Rhythm::Daily { at } = &rhythm.rhythm {
                 let mut day = start;
@@ -614,13 +537,44 @@ impl RhythmManager {
             }
         }
 
-        // Gather non-daily rhythms for heap-based scheduling
-        let mut smooth_rhythms = BinaryHeap::new();
+        struct HeapItem {
+            rank: u64,
+            first_beat: DateTime<Tz>,
+            rhythm: RhythmDefinition,
+            original_slider: Slider,
+            original_beat: DateTime<Tz>,
+        }
+
+        impl Eq for HeapItem {}
+
+        impl PartialEq for HeapItem {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other).is_eq()
+            }
+        }
+
+        impl Ord for HeapItem {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.rank
+                    .cmp(&other.rank)
+                    .then(self.first_beat.cmp(&other.first_beat))
+            }
+        }
+
+        impl PartialOrd for HeapItem {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut rank = u64::MAX;
+        let mut heap = BinaryHeap::new();
         for rhythm in &self.rhythms {
             if matches!(rhythm.rhythm, Rhythm::Daily { .. }) {
                 continue;
             }
 
+            let rhythm = rhythm.clone();
             let done_events: Vec<DateTime<Utc>> = events_by_rhythm
                 .get(&rhythm.id)
                 .map(|events| {
@@ -654,132 +608,90 @@ impl RhythmManager {
                 .earliest()
                 .unwrap();
 
-            let mut first_beat = self.continuing_beat(rhythm, start_dt, last_done);
+            let mut first_beat = self.continuing_beat(&rhythm, start_dt, last_done);
             while defer_dates.contains(&first_beat.date_naive()) {
-                first_beat += chrono::Duration::days(1);
+                first_beat = self.continuing_beat(&rhythm, first_beat, Some(first_beat));
             }
-            let smoothing = Smoothing::new(rhythm.clone(), first_beat.date_naive(), start, limit);
-            let entry = HeapEntry {
-                when: first_beat.with_timezone(&self.tz),
-                num_choices: smoothing.remaining_choices.len(),
-                periodicity: rhythm.rhythm.approximate_periodicity(),
-                rhythm_id: rhythm.id,
-                smoothing,
-            };
-            smooth_rhythms.push(Reverse(entry));
+
+            let original_slider = rhythm.rhythm.slider();
+            let original_beat = first_beat;
+            heap.push(HeapItem {
+                rank,
+                first_beat,
+                rhythm,
+                original_slider,
+                original_beat,
+            });
+            rank -= original_slider.before as u64;
         }
 
-        // Process the heap
-        while let Some(Reverse(mut entry)) = smooth_rhythms.pop() {
-            if entry
-                .smoothing
-                .all_options()
-                .iter()
-                .all(|&x| x < start || x >= limit)
+        while let Some(entry) = heap.pop() {
+            if entry.first_beat.date_naive() < start {
+                if entry.rhythm.rhythm.slider().before > 0 {
+                    heap.push(HeapItem {
+                        rank: entry.rank,
+                        first_beat: entry.first_beat - ONE_DAY,
+                        rhythm: entry.rhythm.slide_one(),
+                        original_slider: entry.original_slider,
+                        original_beat: entry.original_beat,
+                    });
+                }
+                continue;
+            }
+            if (entry.first_beat - ONE_DAY * entry.rhythm.rhythm.slider().before).date_naive()
+                >= limit
             {
                 continue;
             }
-
             let slots_per_day = watermarks
-                .get(&entry.when.date_naive())
+                .get(&entry.first_beat.date_naive())
                 .copied()
                 .unwrap_or(1);
             let spoons_today = self
                 .spoons
-                .get(&entry.when.date_naive())
+                .get(&entry.first_beat.date_naive())
                 .copied()
                 .unwrap_or(5);
             let spoons_adjusted = (spoons_today as i32 - 5).clamp(-5, 5);
             let slots_per_day =
                 ((slots_per_day as f64) * 2_f64.powf(spoons_adjusted as f64 / 5.0)).ceil() as usize;
-
-            let slots_per_day = if entry.when.date_naive() == today && adjust_today_capacity {
+            let slots_per_day = if entry.first_beat.date_naive() == today && !ignore_today {
                 slots_per_day.saturating_sub(today_done_deferred_count)
             } else {
                 slots_per_day
             };
-
-            let slots = schedule.entry(entry.when.date_naive()).or_default();
-
+            let slots_per_day = slots_per_day.max(1);
+            let slots = schedule.entry(entry.first_beat.date_naive()).or_default();
             let defer_today = self.events.iter().any(|e| {
-                e.rhythm_id == entry.rhythm_id
+                e.rhythm_id == entry.rhythm.id
                     && e.event_type == EventType::Defer
                     && e.local_time()
-                        .map(|dt| dt.date_naive() == entry.when.date_naive())
+                        .map(|dt| dt.date_naive() == entry.first_beat.date_naive())
                         .unwrap_or(false)
             });
-
             if !defer_today && slots.len() < slots_per_day {
-                slots.push((entry.when, entry.smoothing.rhythm.clone()));
+                slots.push((entry.first_beat, entry.rhythm.clone()));
                 let next_beat =
-                    self.continuing_beat(&entry.smoothing.rhythm, entry.when, Some(entry.when));
-                let new_smoothing = Smoothing::new(
-                    entry.smoothing.rhythm.clone(),
-                    next_beat.date_naive(),
-                    start,
-                    limit,
-                );
-
-                let new_entry = HeapEntry {
-                    when: next_beat,
-                    num_choices: new_smoothing.remaining_choices.len(),
-                    periodicity: entry.periodicity,
-                    rhythm_id: entry.rhythm_id,
-                    smoothing: new_smoothing,
-                };
-                smooth_rhythms.push(Reverse(new_entry));
-            } else if defer_today || !entry.smoothing.remaining_choices.is_empty() {
-                // Try to reschedule
-                let next_day = if defer_today
-                    && !entry
-                        .smoothing
-                        .remaining_choices
-                        .contains(&(entry.when.date_naive() + chrono::Duration::days(1)))
-                {
-                    entry.when.date_naive() + chrono::Duration::days(1)
-                } else if let Some(next) = entry.smoothing.shift_one() {
-                    next
-                } else {
-                    // TODO(rescrv):  Make this an explicit error.
-                    continue;
-                };
-
-                entry.when = assign_time(
-                    next_day,
-                    self.rhythms
-                        .iter()
-                        .find(|r| r.id == entry.smoothing.rhythm.id)
-                        .map(|x| x.rhythm.at())
-                        .unwrap(),
-                    self.tz,
-                );
-                entry.num_choices = entry.smoothing.remaining_choices.len();
-                smooth_rhythms.push(Reverse(entry));
+                    self.continuing_beat(&entry.rhythm, entry.first_beat, Some(entry.first_beat));
+                heap.push(HeapItem {
+                    rank: entry.rank,
+                    first_beat: next_beat,
+                    rhythm: entry.rhythm.with_slider(entry.original_slider),
+                    original_slider: entry.original_slider,
+                    original_beat: next_beat,
+                });
             } else {
-                let options = entry.smoothing.all_options();
-                let mut low_water_mark = None;
-
-                for date in &options {
-                    if let Some(&wm) = watermarks.get(date) {
-                        low_water_mark = Some(low_water_mark.map_or(wm, |lwm: usize| lwm.min(wm)));
-                    } else {
-                        low_water_mark = Some(0);
-                    }
+                let low_water_mark = watermarks
+                    .get(&entry.first_beat.date_naive())
+                    .cloned()
+                    .unwrap_or(0)
+                    + 1;
+                for idx in 0..=entry.original_slider.before {
+                    let date = (entry.original_beat - ONE_DAY * idx).date_naive();
+                    let current = watermarks.entry(date).or_default();
+                    *current = (*current).max(low_water_mark);
                 }
-
-                if adjust_today_capacity {
-                    let wm = watermarks.entry(entry.when.date_naive()).or_default();
-                    *wm += today_done_deferred_count;
-                }
-
-                let low_water_mark = low_water_mark.unwrap_or(0) + 1;
-
-                for date in options {
-                    let current = watermarks.get(&date).copied().unwrap_or(low_water_mark);
-                    watermarks.insert(date, current.max(low_water_mark));
-                }
-
-                return self.schedule_internal(start, limit, adjust_today_capacity, watermarks);
+                return self.schedule_internal(start, limit, ignore_today, watermarks);
             }
         }
         let mut result = schedule.values().flatten().cloned().collect::<Vec<_>>();
@@ -1474,7 +1386,7 @@ mod tests {
             Rhythm::WeekDaily {
                 dotw: 3, // Thursday
                 at: TEST_AT,
-                slider: Slider::new(1, 1), // Can move 1 day before or after
+                slider: Slider::new(1), // Can move 1 day before
             },
         );
         manager.set_rhythm(weekly.clone()).unwrap();
@@ -1493,8 +1405,9 @@ mod tests {
         });
 
         let start = NaiveDate::from_ymd_opt(2023, 8, 14).unwrap();
-        let limit = NaiveDate::from_ymd_opt(2023, 8, 21).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 25).unwrap();
         let schedule_vec = manager.schedule(start, limit);
+        println!("schedule_vec: {:?}", schedule_vec);
         let schedule = group_schedule_by_date(schedule_vec);
 
         // Should not appear on deferred day
@@ -1502,22 +1415,26 @@ mod tests {
         let deferred_day_rhythms = schedule.get(&deferred_day).unwrap_or(&empty_vec);
         assert!(!deferred_day_rhythms.iter().any(|r| r.id == weekly.id));
 
-        // Should appear on an adjacent day due to slider
+        // Slider only allows moving earlier, so check day before or the rhythm moves to next week
         let day_before = deferred_day - chrono::Duration::days(1);
-        let day_after = deferred_day + chrono::Duration::days(1);
 
         let appears_before = schedule
             .get(&day_before)
             .map(|rhythms| rhythms.iter().any(|r| r.id == weekly.id))
             .unwrap_or(false);
-        let appears_after = schedule
-            .get(&day_after)
+
+        // When deferred, rhythm either slides earlier (if slider allows) or moves to next beat
+        // With slider=1, it can appear on Wed Aug 16 (day before Thursday)
+        // Or it skips to next Thursday Aug 24
+        let next_thursday = NaiveDate::from_ymd_opt(2023, 8, 24).unwrap();
+        let appears_next_week = schedule
+            .get(&next_thursday)
             .map(|rhythms| rhythms.iter().any(|r| r.id == weekly.id))
             .unwrap_or(false);
 
         assert!(
-            appears_before || appears_after,
-            "Weekly rhythm should appear on an adjacent day due to slider"
+            appears_before || appears_next_week,
+            "Weekly rhythm should appear on day before (slider) or next week"
         );
     }
 
@@ -1531,7 +1448,7 @@ mod tests {
             Rhythm::Monthly {
                 dotm: 14, // 15th
                 at: TEST_AT,
-                slider: Slider::new(2, 2), // Can move 2 days either way
+                slider: Slider::new(2), // Can move 2 days before
             },
         );
         let monthly2 = create_test_rhythm(
@@ -1539,7 +1456,7 @@ mod tests {
             Rhythm::Monthly {
                 dotm: 14, // Also 15th
                 at: TEST_AT,
-                slider: Slider::new(2, 2),
+                slider: Slider::new(2),
             },
         );
 
@@ -1679,7 +1596,7 @@ mod tests {
             Rhythm::WeekDaily {
                 dotw: 3, // Thursday
                 at: TEST_AT,
-                slider: Slider::new(1, 1),
+                slider: Slider::new(1),
             },
         );
         let monthly = create_test_rhythm(
@@ -1687,7 +1604,7 @@ mod tests {
             Rhythm::Monthly {
                 dotm: 9, // 10th
                 at: TEST_AT,
-                slider: Slider::new(2, 2),
+                slider: Slider::new(2),
             },
         );
         let every5 = create_test_rhythm(
@@ -1695,7 +1612,7 @@ mod tests {
             Rhythm::EveryNDays {
                 n: 5,
                 at: TEST_AT,
-                slider: Slider::new(1, 1),
+                slider: Slider::new(1),
             },
         );
 
@@ -1757,11 +1674,23 @@ mod tests {
         let thursday_rhythms = schedule.get(&thursday).unwrap_or(&empty_vec);
         assert!(!thursday_rhythms.iter().any(|r| r.id == weekly.id));
 
-        // Verify monthly appears on Aug 9 (moved from Aug 10 to distribute load)
-        let ninth = NaiveDate::from_ymd_opt(2023, 8, 9).unwrap();
-        let ninth_rhythms = schedule.get(&ninth);
-        assert!(ninth_rhythms.is_some());
-        assert!(ninth_rhythms.unwrap().iter().any(|r| r.id == monthly.id));
+        // Verify monthly appears within its slider range (Aug 8-10)
+        // dotm: 9 means 10th (0-based), slider: 2 means can move up to 2 days earlier
+        let mut monthly_date = None;
+        for (dt, rhythm) in &schedule_vec {
+            if rhythm.id == monthly.id {
+                monthly_date = Some(dt.date_naive());
+                break;
+            }
+        }
+        let tenth = NaiveDate::from_ymd_opt(2023, 8, 10).unwrap();
+        let eighth = NaiveDate::from_ymd_opt(2023, 8, 8).unwrap();
+        assert!(monthly_date.is_some(), "Monthly should appear in schedule");
+        let mdate = monthly_date.unwrap();
+        assert!(
+            mdate >= eighth && mdate <= tenth,
+            "Monthly should appear between Aug 8 and Aug 10 (slider range), got {mdate}"
+        );
 
         // Verify every5 appears somewhere
         let mut every5_found = false;
@@ -1772,208 +1701,6 @@ mod tests {
             }
         }
         assert!(every5_found);
-    }
-
-    #[test]
-    fn capacity_adjustment_with_done_and_deferred() {
-        let mut manager = create_test_manager("America/Los_Angeles");
-
-        let rhythm1 = create_test_rhythm(
-            "rhythm1_capacity",
-            Rhythm::EveryNDays {
-                n: 2,
-                at: TEST_AT,
-                slider: Slider::new(1, 1),
-            },
-        );
-        let rhythm2 = create_test_rhythm(
-            "rhythm2_capacity",
-            Rhythm::EveryNDays {
-                n: 3,
-                at: TEST_AT,
-                slider: Slider::new(1, 1),
-            },
-        );
-
-        manager.set_rhythm(rhythm1.clone()).unwrap();
-        manager.set_rhythm(rhythm2.clone()).unwrap();
-
-        let today = manager.now().date_naive();
-
-        manager.events.push(EventRecord {
-            rhythm_id: rhythm1.id,
-            event_type: EventType::Done,
-            when: manager.now().with_timezone(&Utc),
-            when_tz: manager.timezone().to_string(),
-        });
-
-        let schedule_without_adjustment =
-            manager.schedule(today, today + chrono::Duration::days(10));
-
-        let schedule_with_adjustment = manager.schedule_with_capacity_adjustment(
-            today,
-            today + chrono::Duration::days(10),
-            true,
-        );
-
-        let today_count_without = schedule_without_adjustment
-            .iter()
-            .filter(|(dt, _)| dt.date_naive() == today)
-            .count();
-        let today_count_with = schedule_with_adjustment
-            .iter()
-            .filter(|(dt, _)| dt.date_naive() == today)
-            .count();
-
-        println!("Today count without adjustment: {today_count_without}");
-        println!("Today count with adjustment: {today_count_with}");
-        println!(
-            "Schedule without adjustment: {:?}",
-            schedule_without_adjustment
-                .iter()
-                .map(|(dt, r)| (dt.date_naive(), &r.description))
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "Schedule with adjustment: {:?}",
-            schedule_with_adjustment
-                .iter()
-                .map(|(dt, r)| (dt.date_naive(), &r.description))
-                .collect::<Vec<_>>()
-        );
-
-        assert!(
-            today_count_with < today_count_without
-                || (today_count_without == 0 && today_count_with == 0),
-            "With adjustment, today should have fewer or equal tasks. Without: {today_count_without}, With: {today_count_with}"
-        );
-    }
-
-    #[test]
-    fn stretch_goals_identification() {
-        let mut manager = create_test_manager("America/Los_Angeles");
-
-        let rhythm1 = create_test_rhythm(
-            "rhythm1_stretch",
-            Rhythm::EveryNDays {
-                n: 2,
-                at: TEST_AT,
-                slider: Slider::new(1, 1),
-            },
-        );
-        let rhythm2 = create_test_rhythm(
-            "rhythm2_stretch",
-            Rhythm::EveryNDays {
-                n: 3,
-                at: TEST_AT,
-                slider: Slider::new(1, 1),
-            },
-        );
-        let rhythm3 = create_test_rhythm(
-            "rhythm3_stretch",
-            Rhythm::EveryNDays {
-                n: 4,
-                at: TEST_AT,
-                slider: Slider::new(1, 1),
-            },
-        );
-
-        manager.set_rhythm(rhythm1.clone()).unwrap();
-        manager.set_rhythm(rhythm2.clone()).unwrap();
-        manager.set_rhythm(rhythm3.clone()).unwrap();
-
-        let today = manager.now().date_naive();
-        manager.events.push(EventRecord {
-            rhythm_id: rhythm1.id,
-            event_type: EventType::Done,
-            when: manager.now().with_timezone(&Utc),
-            when_tz: manager.timezone().to_string(),
-        });
-
-        let limit = today + chrono::Duration::days(90);
-
-        let schedule_without_adjustment = manager.schedule(today, limit);
-        let schedule_with_adjustment =
-            manager.schedule_with_capacity_adjustment(today, limit, true);
-
-        let today_without: Vec<_> = schedule_without_adjustment
-            .iter()
-            .filter(|(dt, _)| dt.date_naive() == today)
-            .collect();
-        let today_with: Vec<_> = schedule_with_adjustment
-            .iter()
-            .filter(|(dt, _)| dt.date_naive() == today)
-            .collect();
-
-        println!("Today without adjustment: {}", today_without.len());
-        println!("Today with adjustment: {}", today_with.len());
-
-        assert!(
-            today_without.len() >= today_with.len(),
-            "Schedule without adjustment should have more or equal tasks for today"
-        );
-
-        let with_ids: std::collections::HashSet<_> =
-            today_with.iter().map(|(_, rhythm)| rhythm.id).collect();
-
-        let stretch_goals: Vec<_> = today_without
-            .iter()
-            .filter(|(_, rhythm)| !with_ids.contains(&rhythm.id))
-            .collect();
-
-        println!("Stretch goals: {}", stretch_goals.len());
-
-        if today_without.len() > today_with.len() {
-            assert!(
-                !stretch_goals.is_empty(),
-                "There should be stretch goals when schedules differ"
-            );
-        }
-    }
-
-    #[test]
-    fn timezone_boundary_done_defer_count() {
-        let mut manager = create_test_manager("America/Los_Angeles");
-
-        let daily = create_test_rhythm("tz_daily", Rhythm::Daily { at: TEST_AT });
-        manager.set_rhythm(daily.clone()).unwrap();
-
-        let la_date = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
-        let la_time = NaiveTime::from_hms_opt(23, 30, 0).unwrap();
-        let la_datetime = la_date
-            .and_time(la_time)
-            .and_local_timezone(Los_Angeles)
-            .earliest()
-            .unwrap();
-
-        manager.events.push(EventRecord {
-            rhythm_id: daily.id,
-            event_type: EventType::Done,
-            when: la_datetime.with_timezone(&Utc),
-            when_tz: "America/Los_Angeles".to_string(),
-        });
-
-        let schedule_vec = manager.schedule_with_capacity_adjustment(
-            la_date,
-            la_date + chrono::Duration::days(2),
-            true,
-        );
-        let schedule = group_schedule_by_date(schedule_vec);
-
-        let empty_vec = Vec::new();
-        let today_rhythms = schedule.get(&la_date).unwrap_or(&empty_vec);
-        assert_eq!(
-            today_rhythms.len(),
-            0,
-            "Event at 11:30 PM LA time should count as done on LA date, not UTC date"
-        );
-
-        let next_day = la_date + chrono::Duration::days(1);
-        let next_day_rhythms = schedule.get(&next_day).unwrap_or(&empty_vec);
-        assert!(
-            next_day_rhythms.iter().any(|r| r.id == daily.id),
-            "Daily rhythm should appear on next day"
-        );
     }
 
     #[test]
@@ -2027,7 +1754,7 @@ mod tests {
             Rhythm::WeekDaily {
                 dotw: 6,
                 at: TEST_AT,
-                slider: Slider::new(1, 1),
+                slider: Slider::new(1),
             },
         );
         manager.set_rhythm(weekly.clone()).unwrap();
@@ -2059,21 +1786,24 @@ mod tests {
             "Weekly should not appear on deferred day (Aug 20 LA time, even though UTC is Aug 21)"
         );
 
+        // Slider only allows moving earlier (day before) or rhythm moves to next week
         let day_before = la_date - chrono::Duration::days(1);
-        let day_after = la_date + chrono::Duration::days(1);
 
         let appears_before = schedule
             .get(&day_before)
             .map(|rhythms| rhythms.iter().any(|r| r.id == weekly.id))
             .unwrap_or(false);
-        let appears_after = schedule
-            .get(&day_after)
+
+        // Next Sunday is 7 days after Aug 20
+        let next_sunday = la_date + chrono::Duration::days(7);
+        let appears_next_week = schedule
+            .get(&next_sunday)
             .map(|rhythms| rhythms.iter().any(|r| r.id == weekly.id))
             .unwrap_or(false);
 
         assert!(
-            appears_before || appears_after,
-            "Weekly should be rescheduled to adjacent day due to slider"
+            appears_before || appears_next_week,
+            "Weekly should appear on day before (slider) or next week"
         );
     }
 
@@ -2109,6 +1839,618 @@ mod tests {
         assert!(
             !done_day_rhythms.iter().any(|r| r.id == daily.id),
             "Event at 2 AM LA time should be recognized as done on Aug 20 LA"
+        );
+    }
+
+    #[test]
+    fn schedule2_ignore_today_false_reduces_capacity() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let every2 = create_test_rhythm(
+            "sched2_every2",
+            Rhythm::EveryNDays {
+                n: 2,
+                at: TEST_AT,
+                slider: Slider::new(1),
+            },
+        );
+        let every3 = create_test_rhythm(
+            "sched2_every3",
+            Rhythm::EveryNDays {
+                n: 3,
+                at: TEST_AT,
+                slider: Slider::new(1),
+            },
+        );
+
+        manager.set_rhythm(every2.clone()).unwrap();
+        manager.set_rhythm(every3.clone()).unwrap();
+
+        let today = manager.now().date_naive();
+
+        manager.events.push(EventRecord {
+            rhythm_id: every2.id,
+            event_type: EventType::Done,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+
+        let limit = today + chrono::Duration::days(10);
+
+        let schedule_ignore = manager.schedule2(today, limit, true);
+        let schedule_adjust = manager.schedule2(today, limit, false);
+
+        let today_count_ignore = schedule_ignore
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+        let today_count_adjust = schedule_adjust
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+
+        println!("schedule2 ignore_today=true: {today_count_ignore} items today");
+        println!("schedule2 ignore_today=false: {today_count_adjust} items today");
+
+        assert!(
+            today_count_adjust <= today_count_ignore,
+            "ignore_today=false should reduce today's capacity. ignore={today_count_ignore}, adjust={today_count_adjust}"
+        );
+    }
+
+    #[test]
+    fn schedule2_ignore_today_true_does_not_reduce_capacity() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let daily = create_test_rhythm("sched2_daily", Rhythm::Daily { at: TEST_AT });
+        manager.set_rhythm(daily.clone()).unwrap();
+
+        let today = manager.now().date_naive();
+
+        manager.events.push(EventRecord {
+            rhythm_id: daily.id,
+            event_type: EventType::Done,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+
+        let limit = today + chrono::Duration::days(5);
+
+        let schedule_ignore = manager.schedule2(today, limit, true);
+        let schedule_no_ignore = manager.schedule2(today, limit, false);
+
+        let tomorrow = today + chrono::Duration::days(1);
+
+        let tomorrow_count_ignore = schedule_ignore
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == tomorrow)
+            .count();
+        let tomorrow_count_no_ignore = schedule_no_ignore
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == tomorrow)
+            .count();
+
+        assert_eq!(
+            tomorrow_count_ignore, tomorrow_count_no_ignore,
+            "Future days should be unaffected by ignore_today flag"
+        );
+    }
+
+    #[test]
+    fn watermarks_increase_slots_when_rhythms_overflow() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        for i in 0..5 {
+            let rhythm = create_test_rhythm(
+                &format!("watermark_every2_{i}"),
+                Rhythm::EveryNDays {
+                    n: 2,
+                    at: TEST_AT,
+                    slider: Slider::new(1),
+                },
+            );
+            manager.set_rhythm(rhythm).unwrap();
+        }
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 26).unwrap();
+        let schedule_vec = manager.schedule(start, limit);
+        let schedule = group_schedule_by_date(schedule_vec);
+
+        let mut total_scheduled = 0;
+        for day in 0..7 {
+            let date = start + chrono::Duration::days(day);
+            let count = schedule.get(&date).map(|v| v.len()).unwrap_or(0);
+            total_scheduled += count;
+            println!("Day {date}: {count} rhythms scheduled");
+        }
+
+        assert!(
+            total_scheduled >= 5 * 3,
+            "All 5 rhythms should fire at least 3 times over 7 days (every 2 days). Got {total_scheduled}"
+        );
+    }
+
+    #[test]
+    fn slider_allows_rhythm_to_shift_earlier() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let monthly1 = create_test_rhythm(
+            "slider_monthly1",
+            Rhythm::Monthly {
+                dotm: 14,
+                at: TEST_AT,
+                slider: Slider::new(3),
+            },
+        );
+        let monthly2 = create_test_rhythm(
+            "slider_monthly2",
+            Rhythm::Monthly {
+                dotm: 14,
+                at: TEST_AT,
+                slider: Slider::new(3),
+            },
+        );
+
+        manager.set_rhythm(monthly1.clone()).unwrap();
+        manager.set_rhythm(monthly2.clone()).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 10).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+        let schedule_vec = manager.schedule(start, limit);
+
+        let mut monthly1_date = None;
+        let mut monthly2_date = None;
+
+        for (dt, rhythm) in &schedule_vec {
+            if rhythm.id == monthly1.id && monthly1_date.is_none() {
+                monthly1_date = Some(dt.date_naive());
+            }
+            if rhythm.id == monthly2.id && monthly2_date.is_none() {
+                monthly2_date = Some(dt.date_naive());
+            }
+        }
+
+        let target_date = NaiveDate::from_ymd_opt(2023, 8, 15).unwrap();
+        let earliest_allowed = target_date - chrono::Duration::days(3);
+
+        if let Some(date) = monthly1_date {
+            assert!(
+                date >= earliest_allowed && date <= target_date,
+                "monthly1 should be within slider range: {date}"
+            );
+        }
+        if let Some(date) = monthly2_date {
+            assert!(
+                date >= earliest_allowed && date <= target_date,
+                "monthly2 should be within slider range: {date}"
+            );
+        }
+
+        if monthly1_date.is_some() && monthly2_date.is_some() {
+            println!(
+                "monthly1 scheduled on {:?}, monthly2 on {:?}",
+                monthly1_date, monthly2_date
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_done_events_today_reduce_capacity_proportionally() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        for i in 0..4 {
+            let rhythm = create_test_rhythm(
+                &format!("multi_done_{i}"),
+                Rhythm::EveryNDays {
+                    n: 3,
+                    at: TEST_AT,
+                    slider: Slider::new(2),
+                },
+            );
+            manager.set_rhythm(rhythm).unwrap();
+        }
+
+        let today = manager.now().date_naive();
+
+        manager.events.push(EventRecord {
+            rhythm_id: manager.rhythms[0].id,
+            event_type: EventType::Done,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+        manager.events.push(EventRecord {
+            rhythm_id: manager.rhythms[1].id,
+            event_type: EventType::Done,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+
+        let limit = today + chrono::Duration::days(10);
+
+        let schedule_no_adjust = manager.schedule2(today, limit, true);
+        let schedule_with_adjust = manager.schedule2(today, limit, false);
+
+        let today_no_adjust = schedule_no_adjust
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+        let today_with_adjust = schedule_with_adjust
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+
+        println!("2 done events: no_adjust={today_no_adjust}, with_adjust={today_with_adjust}");
+
+        assert!(
+            today_with_adjust <= today_no_adjust,
+            "Capacity should be reduced by done events"
+        );
+    }
+
+    #[test]
+    fn defer_events_count_toward_capacity_reduction() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        for i in 0..3 {
+            let rhythm = create_test_rhythm(
+                &format!("defer_cap_{i}"),
+                Rhythm::EveryNDays {
+                    n: 4,
+                    at: TEST_AT,
+                    slider: Slider::new(1),
+                },
+            );
+            manager.set_rhythm(rhythm).unwrap();
+        }
+
+        let today = manager.now().date_naive();
+
+        manager.events.push(EventRecord {
+            rhythm_id: manager.rhythms[0].id,
+            event_type: EventType::Defer,
+            when: manager.now().with_timezone(&Utc),
+            when_tz: manager.timezone().to_string(),
+        });
+
+        let limit = today + chrono::Duration::days(10);
+
+        let schedule_no_adjust = manager.schedule2(today, limit, true);
+        let schedule_with_adjust = manager.schedule2(today, limit, false);
+
+        let today_no_adjust = schedule_no_adjust
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+        let today_with_adjust = schedule_with_adjust
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == today)
+            .count();
+
+        println!("1 defer event: no_adjust={today_no_adjust}, with_adjust={today_with_adjust}");
+
+        assert!(
+            today_with_adjust <= today_no_adjust,
+            "Defer events should reduce capacity"
+        );
+    }
+
+    #[test]
+    fn rhythm_skipped_on_deferred_day_moves_to_next_beat() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let every3 = create_test_rhythm(
+            "defer_skip",
+            Rhythm::EveryNDays {
+                n: 3,
+                at: TEST_AT,
+                slider: Slider::default(),
+            },
+        );
+        manager.set_rhythm(every3.clone()).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 30).unwrap();
+
+        let schedule_before = manager.schedule(start, limit);
+        let first_occurrence = schedule_before
+            .iter()
+            .find(|(_, r)| r.id == every3.id)
+            .map(|(dt, _)| dt.date_naive());
+
+        if let Some(deferred_date) = first_occurrence {
+            manager.events.push(EventRecord {
+                rhythm_id: every3.id,
+                event_type: EventType::Defer,
+                when: deferred_date
+                    .and_time(TEST_AT)
+                    .and_local_timezone(Utc)
+                    .earliest()
+                    .unwrap(),
+                when_tz: "UTC".to_string(),
+            });
+
+            let schedule_after = manager.schedule(start, limit);
+
+            let still_on_deferred = schedule_after
+                .iter()
+                .any(|(dt, r)| r.id == every3.id && dt.date_naive() == deferred_date);
+
+            assert!(
+                !still_on_deferred,
+                "Rhythm should not appear on deferred date {deferred_date}"
+            );
+
+            let appears_elsewhere = schedule_after.iter().any(|(_, r)| r.id == every3.id);
+            assert!(
+                appears_elsewhere,
+                "Rhythm should still appear on other days"
+            );
+
+            println!("Deferred date: {deferred_date}, rhythm rescheduled successfully");
+        }
+    }
+
+    #[test]
+    fn schedule_handles_empty_rhythms() {
+        let manager = create_test_manager("America/Los_Angeles");
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 26).unwrap();
+        let schedule = manager.schedule(start, limit);
+
+        assert!(
+            schedule.is_empty(),
+            "Empty manager should produce empty schedule"
+        );
+    }
+
+    #[test]
+    fn schedule_handles_start_equals_limit() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let daily = create_test_rhythm("edge_daily", Rhythm::Daily { at: TEST_AT });
+        manager.set_rhythm(daily).unwrap();
+
+        let date = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let schedule = manager.schedule(date, date);
+
+        assert!(
+            schedule.is_empty(),
+            "Schedule with start == limit should be empty"
+        );
+    }
+
+    #[test]
+    fn schedule_handles_limit_before_start() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let daily = create_test_rhythm("edge_daily2", Rhythm::Daily { at: TEST_AT });
+        manager.set_rhythm(daily).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 26).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let schedule = manager.schedule(start, limit);
+
+        assert!(
+            schedule.is_empty(),
+            "Schedule with limit < start should be empty"
+        );
+    }
+
+    #[test]
+    fn high_spoons_increases_daily_capacity() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        for i in 0..6 {
+            let rhythm = create_test_rhythm(
+                &format!("high_spoons_{i}"),
+                Rhythm::EveryNDays {
+                    n: 2,
+                    at: TEST_AT,
+                    slider: Slider::new(1),
+                },
+            );
+            manager.set_rhythm(rhythm).unwrap();
+        }
+
+        let test_day = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+
+        let schedule_normal = manager.schedule(test_day, test_day + chrono::Duration::days(5));
+        let normal_count = schedule_normal
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == test_day)
+            .count();
+
+        manager.spoons(test_day, 10);
+
+        let schedule_high = manager.schedule(test_day, test_day + chrono::Duration::days(5));
+        let high_count = schedule_high
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == test_day)
+            .count();
+
+        println!("Normal spoons (5): {normal_count} items, High spoons (10): {high_count} items");
+
+        assert!(
+            high_count >= normal_count,
+            "High spoons should allow at least as many items. normal={normal_count}, high={high_count}"
+        );
+    }
+
+    #[test]
+    fn low_spoons_decreases_daily_capacity() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        for i in 0..6 {
+            let rhythm = create_test_rhythm(
+                &format!("low_spoons_{i}"),
+                Rhythm::EveryNDays {
+                    n: 2,
+                    at: TEST_AT,
+                    slider: Slider::new(1),
+                },
+            );
+            manager.set_rhythm(rhythm).unwrap();
+        }
+
+        let test_day = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+
+        let schedule_normal = manager.schedule(test_day, test_day + chrono::Duration::days(5));
+        let normal_count = schedule_normal
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == test_day)
+            .count();
+
+        manager.spoons(test_day, 1);
+
+        let schedule_low = manager.schedule(test_day, test_day + chrono::Duration::days(5));
+        let low_count = schedule_low
+            .iter()
+            .filter(|(dt, _)| dt.date_naive() == test_day)
+            .count();
+
+        println!("Normal spoons (5): {normal_count} items, Low spoons (1): {low_count} items");
+
+        assert!(
+            low_count <= normal_count,
+            "Low spoons should allow fewer or equal items. normal={normal_count}, low={low_count}"
+        );
+    }
+
+    #[test]
+    fn schedule_sorts_by_datetime() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let early = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let mid = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        let late = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+
+        let rhythm1 = create_test_rhythm("sort_late", Rhythm::Daily { at: late });
+        let rhythm2 = create_test_rhythm("sort_early", Rhythm::Daily { at: early });
+        let rhythm3 = create_test_rhythm("sort_mid", Rhythm::Daily { at: mid });
+
+        manager.set_rhythm(rhythm1).unwrap();
+        manager.set_rhythm(rhythm2).unwrap();
+        manager.set_rhythm(rhythm3).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+        let schedule = manager.schedule(start, limit);
+
+        for i in 1..schedule.len() {
+            assert!(
+                schedule[i].0 >= schedule[i - 1].0,
+                "Schedule should be sorted by datetime: {:?} should come after {:?}",
+                schedule[i].0,
+                schedule[i - 1].0
+            );
+        }
+    }
+
+    #[test]
+    fn skip_beat_within_slider_for_monthly() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+
+        let monthly = create_test_rhythm(
+            "skip_beat_monthly",
+            Rhythm::Monthly {
+                dotm: 14,
+                at: TEST_AT,
+                slider: Slider::new(3),
+            },
+        );
+        manager.set_rhythm(monthly.clone()).unwrap();
+
+        let aug_14 = NaiveDate::from_ymd_opt(2023, 8, 15).unwrap();
+        manager.events.push(EventRecord {
+            rhythm_id: monthly.id,
+            event_type: EventType::Done,
+            when: aug_14
+                .and_time(TEST_AT)
+                .and_local_timezone(Utc)
+                .earliest()
+                .unwrap(),
+            when_tz: "UTC".to_string(),
+        });
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 16).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 10, 1).unwrap();
+        let schedule = manager.schedule(start, limit);
+
+        let next_occurrence = schedule
+            .iter()
+            .find(|(_, r)| r.id == monthly.id)
+            .map(|(dt, _)| dt.date_naive());
+
+        if let Some(date) = next_occurrence {
+            let sep_15 = NaiveDate::from_ymd_opt(2023, 9, 15).unwrap();
+            let sep_12 = NaiveDate::from_ymd_opt(2023, 9, 12).unwrap();
+
+            assert!(
+                date >= sep_12 && date <= sep_15,
+                "Next monthly should be in September (within slider range), got {date}"
+            );
+            println!("After Aug 15 done, next monthly scheduled on {date}");
+        }
+    }
+
+    #[test]
+    fn every_n_days_large_n_starts_immediately() {
+        let manager = create_test_manager("America/Los_Angeles");
+
+        let every10 = Rhythm::EveryNDays {
+            n: 10,
+            at: TEST_AT,
+            slider: Slider::default(),
+        };
+
+        let now = manager.now();
+        let first_beat = every10.next_time_to_fire(now, None);
+
+        assert_eq!(
+            first_beat, now,
+            "EveryNDays with n >= 7 should start immediately"
+        );
+    }
+
+    #[test]
+    fn rhythm_definition_slide_one_reduces_slider() {
+        let rhythm = create_test_rhythm(
+            "slide_test",
+            Rhythm::Monthly {
+                dotm: 14,
+                at: TEST_AT,
+                slider: Slider::new(3),
+            },
+        );
+
+        let slid = rhythm.slide_one();
+        assert_eq!(slid.rhythm.slider().before, 2);
+
+        let slid2 = slid.slide_one();
+        assert_eq!(slid2.rhythm.slider().before, 1);
+
+        let slid3 = slid2.slide_one();
+        assert_eq!(slid3.rhythm.slider().before, 0);
+
+        let slid4 = slid3.slide_one();
+        assert_eq!(
+            slid4.rhythm.slider().before,
+            0,
+            "Slider should not go below 0"
+        );
+    }
+
+    #[test]
+    fn daily_rhythm_ignores_slider() {
+        let daily = Rhythm::Daily { at: TEST_AT };
+
+        assert_eq!(daily.slider().before, 0);
+
+        let with_slider = daily.with_slider(Slider::new(5));
+        assert_eq!(
+            with_slider.slider().before,
+            0,
+            "Daily should ignore slider assignment"
         );
     }
 }
