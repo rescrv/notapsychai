@@ -414,8 +414,8 @@ async fn get_today(
             "Date overflow".to_string(),
         ))?;
 
-    let schedule_without_adjustment = manager.schedule(today, limit);
-    let schedule_with_adjustment = manager.schedule_with_capacity_adjustment(today, limit, true);
+    let schedule_without_adjustment = manager.schedule2(today, limit, true);
+    let schedule_with_adjustment = manager.schedule2(today, limit, false);
 
     let with_adjustment_ids: std::collections::HashSet<_> = schedule_with_adjustment
         .iter()
