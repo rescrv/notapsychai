@@ -3,30 +3,30 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
-    Router,
 };
 use chrono::Utc;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use notapsychai::api_types::{
+use notapsychai_cadence::api_types::{
     ConvergenceResponse, CreateRhythmRequest, DeferRequest, DelinquentItem, LoginRequest,
     LoginResponse, MarkDoneRequest, RegisterRequest, RegisterResponse, RhythmResponse,
     ScheduleItem, ScheduleQuery, SetSpoonsRequest, SpoonsQuery, SpoonsResponse, UpdateUserRequest,
     UserResponse,
 };
-use notapsychai::{auth, db, RhythmDefinition, RhythmID};
+use notapsychai_cadence::{RhythmDefinition, RhythmID, auth, db};
 
 struct AppError(StatusCode, String);
 
-impl From<notapsychai::Error> for AppError {
-    fn from(err: notapsychai::Error) -> Self {
+impl From<notapsychai_cadence::Error> for AppError {
+    fn from(err: notapsychai_cadence::Error) -> Self {
         AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}"))
     }
 }
@@ -272,7 +272,7 @@ async fn update_rhythm(
     Json(req): Json<CreateRhythmRequest>,
 ) -> Result<Json<RhythmResponse>, AppError> {
     let user_id = extract_user_from_headers(&headers, &state).await?;
-    let rhythm_id = notapsychai::RhythmID::from_human_readable(&id).ok_or(AppError(
+    let rhythm_id = notapsychai_cadence::RhythmID::from_human_readable(&id).ok_or(AppError(
         StatusCode::BAD_REQUEST,
         "Invalid rhythm ID".to_string(),
     ))?;
@@ -414,8 +414,8 @@ async fn get_today(
             "Date overflow".to_string(),
         ))?;
 
-    let schedule_without_adjustment = manager.schedule2(today, limit, true);
-    let schedule_with_adjustment = manager.schedule2(today, limit, false);
+    let schedule_without_adjustment = manager.schedule2(today, limit, false);
+    let schedule_with_adjustment = manager.schedule2(today, limit, true);
 
     let with_adjustment_ids: std::collections::HashSet<_> = schedule_with_adjustment
         .iter()

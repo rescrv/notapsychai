@@ -1,0 +1,29 @@
+[package]
+name = "notapsychai-cadence"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = { workspace = true }
+arrrg = { workspace = true } 
+arrrg_derive = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+crossterm = { workspace = true }
+dirs = { workspace = true }
+edit = { workspace = true }
+getopts = { workspace = true }
+jsonwebtoken = { workspace = true }
+one_two_eight = { workspace = true }
+ratatui = { workspace = true }
+reqwest = { workspace = true }
+rpassword = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2.workspace = true
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }

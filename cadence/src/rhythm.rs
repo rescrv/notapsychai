@@ -5,7 +5,7 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use uuid::Uuid;
 
-use crate::{assign_time, change_time, ONE_DAY};
+use crate::{ONE_DAY, assign_time, change_time};
 
 ///////////////////////////////////////////// RhythmID /////////////////////////////////////////////
 
@@ -1366,16 +1366,20 @@ mod tests {
         let yesterday = today - chrono::Duration::days(1);
         let tomorrow = today + chrono::Duration::days(1);
 
-        assert!(schedule
-            .get(&yesterday)
-            .unwrap_or(&empty_vec)
-            .iter()
-            .any(|r| r.id == daily.id));
-        assert!(schedule
-            .get(&tomorrow)
-            .unwrap_or(&empty_vec)
-            .iter()
-            .any(|r| r.id == daily.id));
+        assert!(
+            schedule
+                .get(&yesterday)
+                .unwrap_or(&empty_vec)
+                .iter()
+                .any(|r| r.id == daily.id)
+        );
+        assert!(
+            schedule
+                .get(&tomorrow)
+                .unwrap_or(&empty_vec)
+                .iter()
+                .any(|r| r.id == daily.id)
+        );
     }
 
     #[test]

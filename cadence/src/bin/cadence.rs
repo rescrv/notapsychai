@@ -1,15 +1,25 @@
-use std::io::{self, Write as IoWrite};
+use std::io::{self, Write as IoWrite, stdout};
 use std::str::FromStr;
 
 use arrrg::CommandLine;
 use chrono::{NaiveDate, NaiveTime};
 use chrono_tz::Tz;
-use notapsychai::api_types::{
+use crossterm::ExecutableCommand;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use notapsychai_cadence::api_types::{
     ConvergenceResponse, CreateRhythmRequest, DeferRequest, DelinquentItem, LoginRequest,
     LoginResponse, MarkDoneRequest, RegisterRequest, RegisterResponse, RhythmResponse,
     ScheduleItem, ScheduleQuery, SetSpoonsRequest, UserResponse,
 };
-use notapsychai::{Rhythm, Slider};
+use notapsychai_cadence::{Rhythm, Slider};
+use ratatui::prelude::{CrosstermBackend, Terminal};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, arrrg_derive::CommandLine)]
@@ -111,6 +121,9 @@ struct TodayOptions {
     #[arrrg(flag, "Output as JSON")]
     json: bool,
 }
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, arrrg_derive::CommandLine)]
+struct GuiOptions {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, arrrg_derive::CommandLine)]
 struct ScheduleOptions {
@@ -305,6 +318,7 @@ COMMANDS:
     delete <id>             Delete a rhythm
     edit <id|--all>         Edit rhythm(s) in $EDITOR (YAML format)
     today                   Show today's tasks
+    gui                     Interactive TUI for today's tasks
     schedule <start> <days> Show schedule for date range
     convergence             Show when all rhythms converge
     delinquent              Show delinquent rhythms
@@ -367,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "delete" => cmd_delete(&config, &args).await,
         "edit" => cmd_edit(&config, &args).await,
         "today" => cmd_today(&config, &args).await,
+        "gui" => cmd_gui(&config, &args).await,
         "schedule" => cmd_schedule(&config, &args).await,
         "convergence" => cmd_convergence(&config, &args).await,
         "delinquent" => cmd_delinquent(&config, &args).await,
@@ -991,6 +1006,239 @@ async fn cmd_today(config: &Config, args: &[String]) -> Result<(), Box<dyn std::
         }
     }
 
+    Ok(())
+}
+
+/// Represents a clickable region in the GUI.
+struct ClickRegion {
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+    action: GuiAction,
+}
+
+/// Actions that can be triggered by clicking in the GUI.
+#[derive(Clone)]
+enum GuiAction {
+    MarkDone(String),
+    Defer(String),
+}
+
+/// GUI application state.
+struct GuiApp {
+    lines: Vec<String>,
+    regions: Vec<ClickRegion>,
+}
+
+impl GuiApp {
+    fn new(items: &[ScheduleItem], user_tz: &Tz) -> Self {
+        let mut lines = Vec::new();
+        let mut regions = Vec::new();
+
+        let regular_items: Vec<_> = items.iter().filter(|item| !item.stretch_goal).collect();
+        let stretch_items: Vec<_> = items.iter().filter(|item| item.stretch_goal).collect();
+
+        let mut row = 0u16;
+
+        if regular_items.is_empty() && stretch_items.is_empty() {
+            lines.push("No scheduled items for today.".to_string());
+        } else {
+            for item in &regular_items {
+                let local_time = item.datetime.with_timezone(user_tz);
+                let (line, item_regions) =
+                    Self::format_item(item, &local_time.format("%H:%M:%S").to_string(), row);
+                lines.push(line);
+                regions.extend(item_regions);
+                row += 1;
+            }
+
+            if !stretch_items.is_empty() {
+                if !regular_items.is_empty() {
+                    lines.push(String::new());
+                    row += 1;
+                }
+                lines.push("Stretch goals:".to_string());
+                row += 1;
+                for item in &stretch_items {
+                    let local_time = item.datetime.with_timezone(user_tz);
+                    let (line, item_regions) =
+                        Self::format_item(item, &local_time.format("%H:%M:%S").to_string(), row);
+                    lines.push(line);
+                    regions.extend(item_regions);
+                    row += 1;
+                }
+            }
+        }
+
+        Self { lines, regions }
+    }
+
+    fn format_item(
+        item: &ScheduleItem,
+        formatted_time: &str,
+        row: u16,
+    ) -> (String, Vec<ClickRegion>) {
+        let mut regions = Vec::new();
+        let done_text = "done";
+        let defer_text = "defer";
+
+        let done_start = 0u16;
+        let done_end = done_text.len() as u16;
+        regions.push(ClickRegion {
+            row,
+            col_start: done_start,
+            col_end: done_end,
+            action: GuiAction::MarkDone(item.rhythm_id.clone()),
+        });
+
+        let defer_start = done_end + 1;
+        let defer_end = defer_start + defer_text.len() as u16;
+        regions.push(ClickRegion {
+            row,
+            col_start: defer_start,
+            col_end: defer_end,
+            action: GuiAction::Defer(item.rhythm_id.clone()),
+        });
+
+        let line = format!(
+            "{} {} {} - {} [{}]",
+            done_text, defer_text, formatted_time, item.description, item.rhythm_id
+        );
+
+        (line, regions)
+    }
+
+    fn run(&self) -> io::Result<Option<GuiAction>> {
+        enable_raw_mode()?;
+        stdout()
+            .execute(EnterAlternateScreen)?
+            .execute(EnableMouseCapture)?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+
+        let result = self.run_loop(&mut terminal);
+
+        disable_raw_mode()?;
+        stdout()
+            .execute(LeaveAlternateScreen)?
+            .execute(DisableMouseCapture)?;
+
+        result
+    }
+
+    fn run_loop(
+        &self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> io::Result<Option<GuiAction>> {
+        loop {
+            terminal.draw(|f| self.ui(f))?;
+
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                        return Ok(None);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && let Some(action) = self.find_action_at(mouse.column, mouse.row)
+                    {
+                        return Ok(Some(action));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn ui(&self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        let text = self.lines.join("\n");
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .title("Today's Tasks (click done/defer, q or Esc to quit)")
+                    .borders(Borders::ALL),
+            );
+        frame.render_widget(paragraph, area);
+    }
+
+    fn find_action_at(&self, col: u16, row: u16) -> Option<GuiAction> {
+        let adjusted_row = row.saturating_sub(1);
+        let adjusted_col = col.saturating_sub(1);
+
+        self.regions
+            .iter()
+            .find(|region| {
+                region.row == adjusted_row
+                    && adjusted_col >= region.col_start
+                    && adjusted_col < region.col_end
+            })
+            .map(|region| region.action.clone())
+    }
+}
+
+async fn cmd_gui(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let (_opts, _remaining) = GuiOptions::from_arguments_relaxed("cadence gui", &args_str);
+    config.require_auth()?;
+    let user_tz = get_user_timezone(config).await?;
+
+    loop {
+        let items = fetch_today_items(config).await?;
+        let app = GuiApp::new(&items, &user_tz);
+        match app.run()? {
+            Some(GuiAction::MarkDone(id)) => {
+                do_mark_done(config, &id).await?;
+            }
+            Some(GuiAction::Defer(id)) => {
+                do_defer(config, &id).await?;
+            }
+            None => break,
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_today_items(
+    config: &Config,
+) -> Result<Vec<ScheduleItem>, Box<dyn std::error::Error>> {
+    let token = config.require_auth()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/today", config.server_url))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    let response = check_response_success(response, "Get today's schedule").await?;
+    let items: Vec<ScheduleItem> = response.json().await?;
+    Ok(items)
+}
+
+async fn do_mark_done(config: &Config, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = config.require_auth()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/rhythms/{id}/done", config.server_url))
+        .bearer_auth(token)
+        .json(&MarkDoneRequest { when: None })
+        .send()
+        .await?;
+    check_response_success(response, "Mark done").await?;
+    Ok(())
+}
+
+async fn do_defer(config: &Config, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = config.require_auth()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/rhythms/{id}/defer", config.server_url))
+        .bearer_auth(token)
+        .json(&DeferRequest { when: None })
+        .send()
+        .await?;
+    check_response_success(response, "Defer rhythm").await?;
     Ok(())
 }
 
