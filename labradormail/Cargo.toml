@@ -1,0 +1,11 @@
+[package]
+name = "labradormail"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+
+[dependencies]
+async-trait = "0.1"
+crossterm = "0.29"
+bitflags = "2"
+unicode-width = "0.2"
