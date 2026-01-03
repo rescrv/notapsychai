@@ -2,6 +2,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use agent_inbox_protocol::{Body, Mailbox, MailboxName, Message, QueryParameters, QueryResult};
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -41,6 +42,7 @@ impl IntoResponse for AppError {
 struct AppState {
     pool: PgPool,
     jwt_secret: String,
+    hostname: String,
 }
 
 #[tokio::main]
@@ -49,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let allowed_origins = env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| "*".to_string());
+    let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -57,7 +60,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let state = Arc::new(AppState { pool, jwt_secret });
+    let state = Arc::new(AppState {
+        pool,
+        jwt_secret,
+        hostname,
+    });
 
     let cors = if allowed_origins == "*" {
         CorsLayer::permissive()
@@ -75,17 +82,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/auth/logout", post(logout))
         .route("/rhythms", get(list_rhythms).post(create_rhythm))
         .route(
-            "/rhythms/:id",
+            "/rhythms/{id}",
             get(get_rhythm).put(update_rhythm).delete(delete_rhythm),
         )
-        .route("/rhythms/:id/done", post(mark_done))
-        .route("/rhythms/:id/defer", post(defer_rhythm))
+        .route("/rhythms/{id}/done", post(mark_done))
+        .route("/rhythms/{id}/defer", post(defer_rhythm))
         .route("/schedule", get(get_schedule))
         .route("/today", get(get_today))
         .route("/delinquent", get(get_delinquent))
         .route("/convergence", get(get_convergence))
         .route("/spoons", get(get_spoons).put(set_spoons))
         .route("/user", get(get_user).put(update_user))
+        .route("/inbox/query", post(inbox_query))
         .layer(cors)
         .with_state(state);
 
@@ -516,4 +524,88 @@ async fn update_user(
     let user_id = extract_user_from_headers(&headers, &state).await?;
     db::update_user_timezone(&state.pool, user_id, &req.timezone).await?;
     Ok(StatusCode::OK)
+}
+
+async fn inbox_query(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(params): Json<QueryParameters>,
+) -> Result<Json<QueryResult>, AppError> {
+    let user_id = extract_user_from_headers(&headers, &state).await?;
+    let manager = db::load_rhythm_manager(&state.pool, user_id).await?;
+
+    let today = manager.now().date_naive();
+    let limit = today
+        .checked_add_days(chrono::Days::new(90))
+        .ok_or(AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Date overflow".to_string(),
+        ))?;
+
+    let schedule = manager.schedule(today, limit);
+    let from_addr =
+        agent_inbox_protocol::From::new(format!("cadence@{}", state.hostname)).ok_or(AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid from address".to_string(),
+        ))?;
+
+    let mut messages: Vec<Message> = schedule
+        .into_iter()
+        .map(|(datetime, rhythm_def)| Message {
+            date: datetime.with_timezone(&Utc),
+            from: from_addr.clone(),
+            body: Body::new(&rhythm_def.description).unwrap_or_default(),
+            wrap: true,
+        })
+        .collect();
+
+    // Apply search filter (substring equality)
+    if let Some(ref search) = params.search {
+        messages.retain(|msg| {
+            let body_str = format!("{:?}", msg.body);
+            body_str.contains(search)
+        });
+    }
+
+    // Apply keywords filter (substring equality for any keyword)
+    if let Some(ref keywords) = params.keywords
+        && !keywords.is_empty()
+    {
+        messages.retain(|msg| {
+            let body_str = format!("{:?}", msg.body);
+            keywords.iter().any(|kw| body_str.contains(kw))
+        });
+    }
+
+    // Apply max_per_inbox limit
+    if let Some(max) = params.max_per_inbox {
+        messages.truncate(max as usize);
+    }
+
+    let mailbox_name = MailboxName::new("Cadence").ok_or(AppError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Invalid mailbox name".to_string(),
+    ))?;
+
+    let mailbox = Mailbox {
+        name: mailbox_name,
+        messages,
+    };
+
+    let mut mailboxes = vec![mailbox];
+
+    // Apply max_across_inboxes limit (we only have one mailbox, but respect the limit)
+    if let Some(max) = params.max_across_inboxes {
+        let total: usize = mailboxes.iter().map(|m| m.messages.len()).sum();
+        if total > max as usize {
+            let mut remaining = max as usize;
+            for mailbox in &mut mailboxes {
+                let take = remaining.min(mailbox.messages.len());
+                mailbox.messages.truncate(take);
+                remaining = remaining.saturating_sub(take);
+            }
+        }
+    }
+
+    Ok(Json(QueryResult::new(mailboxes)))
 }
