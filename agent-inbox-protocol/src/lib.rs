@@ -123,9 +123,30 @@ pub struct QueryParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keywords: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_keywords: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox: Option<MailboxName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailboxes: Option<Vec<MailboxName>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<From>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_per_inbox: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_across_inboxes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SortOrder>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
+pub enum SortOrder {
+    DateAsc,
+    DateDesc,
+    Relevance,
 }
 
 /////////////////////////////////////////// QueryResults ///////////////////////////////////////////
