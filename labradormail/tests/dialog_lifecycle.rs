@@ -1,13 +1,20 @@
-use gui::window_reflow;
-use gui::AllDialogsWindow;
-use gui::Dialog;
-use gui::GuiContext;
-use gui::MuttWindow;
-use gui::RootWindow;
-use gui::WindowActionFlags;
-use gui::WindowOrientation;
-use gui::WindowSize;
-use gui::WindowType;
+use labradormail::simple_color_apply_config;
+use labradormail::window_reflow;
+use labradormail::AllDialogsWindow;
+use labradormail::ColorConfigEntry;
+use labradormail::ColorId;
+use labradormail::Dialog;
+use labradormail::GuiContext;
+use labradormail::HelpBar;
+use labradormail::HelpData;
+use labradormail::HelpItem;
+use labradormail::MuttWindow;
+use labradormail::RootWindow;
+use labradormail::StatusBar;
+use labradormail::WindowActionFlags;
+use labradormail::WindowOrientation;
+use labradormail::WindowSize;
+use labradormail::WindowType;
 
 #[test]
 fn dialog_stack_three_deep_lifecycle() {
@@ -151,17 +158,17 @@ fn resize_propagates_through_nested_windows() {
 #[test]
 fn color_config_change_affects_multiple_widgets() {
     let mut ctx = GuiContext::new();
-    gui::simple_color_apply_config(
+    simple_color_apply_config(
         &mut ctx,
         &[
-            gui::ColorConfigEntry {
-                cid: gui::ColorId::Status,
+            ColorConfigEntry {
+                cid: ColorId::Status,
                 fg: Some(crossterm::style::Color::White),
                 bg: Some(crossterm::style::Color::Blue),
                 attrs: vec![crossterm::style::Attribute::Bold],
             },
-            gui::ColorConfigEntry {
-                cid: gui::ColorId::Normal,
+            ColorConfigEntry {
+                cid: ColorId::Normal,
                 fg: Some(crossterm::style::Color::Grey),
                 bg: None,
                 attrs: Vec::new(),
@@ -179,10 +186,10 @@ fn color_config_change_affects_multiple_widgets() {
     root.borrow_mut().state.cols = 20;
     root.borrow_mut().state.rows = 4;
 
-    let help_bar = gui::HelpBar::new();
-    let status_bar = gui::StatusBar::new();
+    let help_bar = HelpBar::new();
+    let status_bar = StatusBar::new();
 
-    let help_data = gui::HelpData::from_items(vec![gui::HelpItem::new("q", "Quit")]);
+    let help_data = HelpData::from_items(vec![HelpItem::new("q", "Quit")]);
     let dialog = Dialog::new(WindowType::DlgIndex);
     dialog.window().borrow_mut().help_data = Some(std::rc::Rc::new(help_data));
 
@@ -193,8 +200,8 @@ fn color_config_change_affects_multiple_widgets() {
     MuttWindow::set_focus(dialog.window());
     window_reflow(&root);
 
-    assert!(ctx.simple_color_get(gui::ColorId::Status).is_set);
-    assert!(ctx.simple_color_get(gui::ColorId::Normal).is_set);
+    assert!(ctx.simple_color_get(ColorId::Status).is_set);
+    assert!(ctx.simple_color_get(ColorId::Normal).is_set);
 
     help_bar.window().borrow_mut().actions |= WindowActionFlags::REPAINT;
     status_bar.window().borrow_mut().actions |= WindowActionFlags::REPAINT;

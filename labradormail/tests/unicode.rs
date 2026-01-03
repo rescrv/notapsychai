@@ -1,13 +1,13 @@
-use gui::mutt_char_width;
-use gui::mutt_str_expand_tabs;
-use gui::mutt_strnwidth;
-use gui::mutt_strwidth;
-use gui::mutt_wstr_trunc;
-use gui::AttrColor;
-use gui::ColorId;
-use gui::GuiContext;
-use gui::MessageWindow;
-use gui::MwChar;
+use labradormail::mutt_char_width;
+use labradormail::mutt_str_expand_tabs;
+use labradormail::mutt_strnwidth;
+use labradormail::mutt_strwidth;
+use labradormail::mutt_wstr_trunc;
+use labradormail::AttrColor;
+use labradormail::ColorId;
+use labradormail::GuiContext;
+use labradormail::MessageWindow;
+use labradormail::MwChar;
 
 #[test]
 fn strnwidth_truncates_mid_utf8() {

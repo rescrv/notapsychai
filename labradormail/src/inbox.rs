@@ -14,15 +14,19 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::future::Future;
 use std::io::stdout;
 use std::io::Result;
 use std::io::Stdout;
 use std::io::Write;
 use std::panic;
-use std::pin::Pin;
 use std::rc::Rc;
 
+use agent_inbox_protocol::Client;
+use agent_inbox_protocol::Mailbox;
+use agent_inbox_protocol::MailboxProvider;
+use agent_inbox_protocol::Message;
+use agent_inbox_protocol::QueryParameters;
+use chrono::Utc;
 use crossterm::cursor::MoveTo;
 use crossterm::event::read;
 use crossterm::event::Event;
@@ -104,131 +108,19 @@ impl DirtyFlags {
     }
 }
 
-/// Threading metadata for rendering a tree.
-#[derive(Clone, Default)]
-pub struct ThreadInfo {
-    /// Depth of the message in the thread tree.
-    pub depth: usize,
-    /// Whether this message is the last sibling at its level.
-    pub is_last: bool,
-    /// For each ancestor level, whether there are more siblings below.
-    pub ancestors_have_more: Vec<bool>,
-}
-
-/// A single email message.
-#[derive(Clone)]
-pub struct Message {
-    /// Date of the message.
-    pub date: String,
-    /// Sender of the message.
-    pub from: String,
-    /// Subject line.
-    pub subject: String,
-    /// Threading metadata.
-    pub thread: ThreadInfo,
-}
-
-impl Message {
-    /// Creates a new message with the given fields.
-    pub fn new(date: &str, from: &str, subject: &str, thread: ThreadInfo) -> Self {
-        Self {
-            date: date.to_string(),
-            from: from.to_string(),
-            subject: subject.to_string(),
-            thread,
-        }
-    }
-}
-
-/// Result type for mailbox operations.
-pub type MailboxResult<T> = std::result::Result<T, MailboxError>;
-
-/// Error type for mailbox operations.
-#[derive(Debug, Clone)]
-pub struct MailboxError {
-    /// Human-readable description of the error.
-    pub message: String,
-}
-
-impl std::fmt::Display for MailboxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for MailboxError {}
-
-impl MailboxError {
-    /// Creates a new mailbox error with the given message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-/// Async trait for mailbox providers.
-///
-/// Implementors of this trait provide access to email messages from various sources
-/// (e.g., local storage, IMAP servers, etc.).
-pub trait Mailbox: Send + Sync {
-    /// Returns the display name of the mailbox.
-    fn name(&self) -> &str;
-
-    /// Fetches the list of messages in the mailbox.
-    fn messages(&self) -> Pin<Box<dyn Future<Output = MailboxResult<Vec<Message>>> + Send + '_>>;
-
-    /// Returns the total count of messages (may be cached).
-    fn message_count(&self) -> Pin<Box<dyn Future<Output = MailboxResult<usize>> + Send + '_>>;
-}
-
 /// Internal mailbox state used by the inbox.
 #[derive(Clone)]
 struct MailboxState {
-    name: String,
-    messages: Vec<Message>,
+    mailbox: Mailbox,
     selected_message: usize,
 }
 
 impl MailboxState {
-    fn new(name: &str, messages: Vec<Message>) -> Self {
+    fn new(mailbox: Mailbox) -> Self {
         Self {
-            name: name.to_string(),
-            messages,
+            mailbox,
             selected_message: 0,
         }
-    }
-}
-
-/// A simple in-memory mailbox implementation.
-pub struct InMemoryMailbox {
-    name: String,
-    messages: Vec<Message>,
-}
-
-impl InMemoryMailbox {
-    /// Creates a new in-memory mailbox with the given name and messages.
-    pub fn new(name: impl Into<String>, messages: Vec<Message>) -> Self {
-        Self {
-            name: name.into(),
-            messages,
-        }
-    }
-}
-
-impl Mailbox for InMemoryMailbox {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn messages(&self) -> Pin<Box<dyn Future<Output = MailboxResult<Vec<Message>>> + Send + '_>> {
-        let messages = self.messages.clone();
-        Box::pin(async move { Ok(messages) })
-    }
-
-    fn message_count(&self) -> Pin<Box<dyn Future<Output = MailboxResult<usize>> + Send + '_>> {
-        let count = self.messages.len();
-        Box::pin(async move { Ok(count) })
     }
 }
 
@@ -253,12 +145,16 @@ struct InboxState {
 impl InboxState {
     /// Extracts render data for drawing.
     fn render_data(&self) -> RenderData {
-        let mailbox = &self.mailbox_states[self.selected_mailbox];
+        let mailbox_state = &self.mailbox_states[self.selected_mailbox];
         RenderData {
             selected_mailbox: self.selected_mailbox,
-            selected_message: mailbox.selected_message,
-            mailbox_names: self.mailbox_states.iter().map(|m| m.name.clone()).collect(),
-            messages: mailbox.messages.clone(),
+            selected_message: mailbox_state.selected_message,
+            mailbox_names: self
+                .mailbox_states
+                .iter()
+                .map(|m| m.mailbox.name.as_str().to_string())
+                .collect(),
+            messages: mailbox_state.mailbox.messages.clone(),
             status_message: self.status_message.clone(),
         }
     }
@@ -271,8 +167,9 @@ impl InboxState {
         &mut self.mailbox_states[self.selected_mailbox]
     }
 
-    fn new(mailboxes: Vec<Box<dyn Mailbox>>) -> Self {
-        let mailbox_states = load_mailbox_states(&mailboxes);
+    fn new(mailboxes: Vec<Mailbox>) -> Self {
+        let mailbox_states: Vec<MailboxState> =
+            mailboxes.into_iter().map(MailboxState::new).collect();
         Self {
             selected_mailbox: 0,
             mailbox_states,
@@ -285,7 +182,9 @@ impl InboxState {
 
     fn select_next_message(&mut self) {
         let mailbox = self.current_mailbox_mut();
-        if mailbox.selected_message < mailbox.messages.len() - 1 {
+        if !mailbox.mailbox.messages.is_empty()
+            && mailbox.selected_message < mailbox.mailbox.messages.len() - 1
+        {
             mailbox.selected_message += 1;
             self.status_message = format!(
                 "Selected message {}",
@@ -310,7 +209,10 @@ impl InboxState {
     fn select_next_mailbox(&mut self) {
         if self.mailbox_states.len() > 1 && self.selected_mailbox < self.mailbox_states.len() - 1 {
             self.selected_mailbox += 1;
-            self.status_message = format!("Selected mailbox: {}", self.current_mailbox().name);
+            self.status_message = format!(
+                "Selected mailbox: {}",
+                self.current_mailbox().mailbox.name.as_str()
+            );
             self.dirty.mark_mailbox_change();
         }
     }
@@ -318,234 +220,105 @@ impl InboxState {
     fn select_prev_mailbox(&mut self) {
         if self.selected_mailbox > 0 {
             self.selected_mailbox -= 1;
-            self.status_message = format!("Selected mailbox: {}", self.current_mailbox().name);
+            self.status_message = format!(
+                "Selected mailbox: {}",
+                self.current_mailbox().mailbox.name.as_str()
+            );
             self.dirty.mark_mailbox_change();
         }
     }
 }
 
-/// Synchronously loads mailbox states from the mailbox trait objects.
-///
-/// This uses a simple blocking executor since the inbox runs in a synchronous context.
-fn load_mailbox_states(mailboxes: &[Box<dyn Mailbox>]) -> Vec<MailboxState> {
-    mailboxes
-        .iter()
-        .map(|mb| {
-            let name = mb.name().to_string();
-            let messages = futures_block_on(mb.messages()).unwrap_or_default();
-            MailboxState::new(&name, messages)
-        })
-        .collect()
-}
-
-/// Simple blocking executor for futures in synchronous context.
-fn futures_block_on<T>(future: Pin<Box<dyn Future<Output = T> + Send + '_>>) -> T {
-    use std::task::Context;
-    use std::task::Poll;
-    use std::task::RawWaker;
-    use std::task::RawWakerVTable;
-    use std::task::Waker;
-
-    fn dummy_raw_waker() -> RawWaker {
-        fn no_op(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
-        RawWaker::new(std::ptr::null(), vtable)
-    }
-
-    let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut pinned = future;
-
-    loop {
-        match pinned.as_mut().poll(&mut cx) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => {
-                std::hint::spin_loop();
-            }
-        }
-    }
-}
-
 /// Creates the default sample mailbox data.
-pub fn sample_mailbox_data() -> Vec<Box<dyn Mailbox>> {
-    let inbox = InMemoryMailbox::new(
-        "INBOX",
-        vec![
-            Message::new(
-                "2024-01-15",
-                "alice@example.com",
-                "Hello World",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2024-01-14",
-                "bob@example.com",
-                "Re: Hello World",
-                ThreadInfo {
-                    depth: 1,
-                    is_last: true,
-                    ancestors_have_more: vec![false],
-                },
-            ),
-            Message::new(
-                "2024-01-13",
-                "charlie@example.com",
-                "Project Update",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2024-01-12",
-                "dave@example.com",
-                "Re: Project Update",
-                ThreadInfo {
-                    depth: 1,
-                    is_last: true,
-                    ancestors_have_more: vec![false],
-                },
-            ),
-            Message::new(
-                "2024-01-11",
-                "eve@example.com",
-                "Re: Project Update (part 2)",
-                ThreadInfo {
-                    depth: 2,
-                    is_last: true,
-                    ancestors_have_more: vec![false, false],
-                },
-            ),
-        ],
-    );
+pub fn sample_mailbox_data() -> Vec<Mailbox> {
+    use agent_inbox_protocol::Body;
+    use agent_inbox_protocol::From;
+    use agent_inbox_protocol::MailboxName;
 
-    let sent = InMemoryMailbox::new(
-        "Sent",
-        vec![
-            Message::new(
-                "2024-01-15",
-                "me@example.com",
-                "Re: Hello World",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2024-01-14",
-                "me@example.com",
-                "Meeting Tomorrow",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2024-01-10",
-                "me@example.com",
-                "Status Update",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: true,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-        ],
-    );
-
-    let drafts = InMemoryMailbox::new(
-        "Drafts",
-        vec![
-            Message::new(
-                "2024-01-15",
-                "me@example.com",
-                "Draft: Proposal",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2024-01-12",
-                "me@example.com",
-                "Draft: Notes",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: true,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-        ],
-    );
-
-    let trash = InMemoryMailbox::new(
-        "Trash",
-        vec![Message::new(
-            "2024-01-08",
-            "spam@example.com",
-            "You've won!",
-            ThreadInfo {
-                depth: 0,
-                is_last: true,
-                ancestors_have_more: Vec::new(),
+    let inbox = Mailbox {
+        name: MailboxName::new("INBOX").expect("valid mailbox name"),
+        messages: vec![
+            Message {
+                date: Utc::now(),
+                from: From::new("alice@example.com").expect("valid from"),
+                body: Body::new("Hello World").expect("valid body"),
+                wrap: false,
             },
-        )],
-    );
-
-    let archive = InMemoryMailbox::new(
-        "Archive",
-        vec![
-            Message::new(
-                "2023-12-20",
-                "team@example.com",
-                "Holiday Schedule",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2023-12-15",
-                "hr@example.com",
-                "Year End Review",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
-            Message::new(
-                "2023-11-01",
-                "admin@example.com",
-                "System Maintenance",
-                ThreadInfo {
-                    depth: 0,
-                    is_last: true,
-                    ancestors_have_more: Vec::new(),
-                },
-            ),
+            Message {
+                date: Utc::now(),
+                from: From::new("bob@example.com").expect("valid from"),
+                body: Body::new("Re: Hello World").expect("valid body"),
+                wrap: false,
+            },
+            Message {
+                date: Utc::now(),
+                from: From::new("charlie@example.com").expect("valid from"),
+                body: Body::new("Project Update").expect("valid body"),
+                wrap: false,
+            },
         ],
-    );
+    };
 
-    vec![
-        Box::new(inbox) as Box<dyn Mailbox>,
-        Box::new(sent),
-        Box::new(drafts),
-        Box::new(trash),
-        Box::new(archive),
-    ]
+    let sent = Mailbox {
+        name: MailboxName::new("Sent").expect("valid mailbox name"),
+        messages: vec![
+            Message {
+                date: Utc::now(),
+                from: From::new("me@example.com").expect("valid from"),
+                body: Body::new("Re: Hello World").expect("valid body"),
+                wrap: false,
+            },
+            Message {
+                date: Utc::now(),
+                from: From::new("me@example.com").expect("valid from"),
+                body: Body::new("Meeting Tomorrow").expect("valid body"),
+                wrap: false,
+            },
+        ],
+    };
+
+    let drafts = Mailbox {
+        name: MailboxName::new("Drafts").expect("valid mailbox name"),
+        messages: vec![Message {
+            date: Utc::now(),
+            from: From::new("me@example.com").expect("valid from"),
+            body: Body::new("Draft: Proposal").expect("valid body"),
+            wrap: false,
+        }],
+    };
+
+    let trash = Mailbox {
+        name: MailboxName::new("Trash").expect("valid mailbox name"),
+        messages: vec![Message {
+            date: Utc::now(),
+            from: From::new("spam@example.com").expect("valid from"),
+            body: Body::new("You've won!").expect("valid body"),
+            wrap: false,
+        }],
+    };
+
+    vec![inbox, sent, drafts, trash]
+}
+
+/// Fetches mailboxes from an agent-inbox-protocol server.
+///
+/// This function connects to the specified base URL (e.g., `http://localhost:8080/inbox`)
+/// and queries for all mailboxes using the provided query parameters.
+pub fn fetch_mailboxes_blocking(
+    base_url: &str,
+    query: QueryParameters,
+) -> std::result::Result<Vec<Mailbox>, String> {
+    let mut client = Client::new(base_url);
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
+
+    runtime.block_on(async {
+        let result = client
+            .query(query)
+            .await
+            .map_err(|e| format!("HTTP query failed: {}", e))?;
+        Ok(result.into_mailboxes())
+    })
 }
 
 fn with_inbox_state(win: &mut MuttWindow, f: impl FnOnce(&mut InboxState)) -> FunctionRetval {
@@ -620,25 +393,6 @@ fn write_padded(out: &mut dyn Write, win: &MuttWindow, text: &str) -> Result<()>
     Ok(())
 }
 
-fn thread_prefix(thread: &ThreadInfo) -> String {
-    let mut prefix = String::new();
-    for has_more in thread.ancestors_have_more.iter().skip(1) {
-        if *has_more {
-            prefix.push_str("│ ");
-        } else {
-            prefix.push_str("  ");
-        }
-    }
-    if thread.depth > 0 {
-        if thread.is_last {
-            prefix.push_str("└─ ");
-        } else {
-            prefix.push_str("├─ ");
-        }
-    }
-    prefix
-}
-
 /// Draws the sidebar.
 fn draw_sidebar(
     ctx: &mut GuiContext,
@@ -700,8 +454,13 @@ fn draw_index(
                 mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
             }
 
-            let prefix = thread_prefix(&msg.thread);
-            let line = format!("{} | {:20} | {}{}", msg.date, msg.from, prefix, msg.subject);
+            let date_str = msg.date.format("%Y-%m-%d").to_string();
+            let line = format!(
+                "{} | {:20} | {}",
+                date_str,
+                msg.from.as_str(),
+                msg.body.as_str()
+            );
             write_padded(out, win, &line)?;
             mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
         } else {
@@ -721,19 +480,20 @@ fn draw_pager(
 ) -> Result<()> {
     mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
 
+    if data.messages.is_empty() {
+        for row in 0u16..(win.state.rows.try_into().expect("positive i16 to fit u16")) {
+            move_to_row(out, win, row)?;
+            write_padded(out, win, "")?;
+        }
+        return Ok(());
+    }
+
     let message = &data.messages[data.selected_message];
-    let lines = vec![
-        format!("From: {}", message.from),
-        format!("Date: {}", message.date),
-        format!("Subject: {}", message.subject),
+    let lines = [
+        format!("From: {}", message.from.as_str()),
+        format!("Date: {}", message.date.format("%Y-%m-%d %H:%M:%S")),
         String::new(),
-        "This is the message body.".to_string(),
-        String::new(),
-        "Lorem ipsum dolor sit amet, consectetur adipiscing elit.".to_string(),
-        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.".to_string(),
-        String::new(),
-        "Best regards,".to_string(),
-        "The Sender".to_string(),
+        message.body.as_str().to_string(),
     ];
 
     for row in 0u16..(win.state.rows.try_into().expect("positive i16 to fit u16")) {
@@ -790,7 +550,7 @@ struct Windows {
 }
 
 impl Windows {
-    fn new(stdout: &mut Stdout, mailboxes: Vec<Box<dyn Mailbox>>) -> Result<Self> {
+    fn new(stdout: &mut Stdout, mailboxes: Vec<Mailbox>) -> Result<Self> {
         let mut ctx = GuiContext::new();
         let root = RootWindow::new(stdout)?;
         ctx.register_root_window(root.root());
@@ -872,12 +632,17 @@ fn redraw(stdout: &mut Stdout, windows: &mut Windows) -> Result<()> {
 
     if windows.state().dirty.index_bar.get() {
         let mailbox_name = &render_data.mailbox_names[render_data.selected_mailbox];
-        let title = format!(
-            " {} [{}/{}] ",
-            mailbox_name,
-            render_data.selected_message + 1,
-            render_data.messages.len()
-        );
+        let msg_count = render_data.messages.len();
+        let title = if msg_count > 0 {
+            format!(
+                " {} [{}/{}] ",
+                mailbox_name,
+                render_data.selected_message + 1,
+                msg_count
+            )
+        } else {
+            format!(" {} [empty] ", mailbox_name)
+        };
         let win = windows.layout.index_bar.borrow();
         draw_status_bar(&mut windows.ctx, stdout, &win, &title)?;
         windows.state().dirty.index_bar.set(false);
@@ -890,10 +655,16 @@ fn redraw(stdout: &mut Stdout, windows: &mut Windows) -> Result<()> {
     }
 
     if windows.state().dirty.pager_bar.get() {
-        let title = format!(
-            " Message: {} ",
-            render_data.messages[render_data.selected_message].subject
-        );
+        let title = if !render_data.messages.is_empty() {
+            format!(
+                " Message: {} ",
+                render_data.messages[render_data.selected_message]
+                    .body
+                    .as_str()
+            )
+        } else {
+            " No messages ".to_string()
+        };
         let win = windows.layout.pager_bar.borrow();
         draw_status_bar(&mut windows.ctx, stdout, &win, &title)?;
         windows.state().dirty.pager_bar.set(false);
@@ -915,7 +686,7 @@ fn redraw(stdout: &mut Stdout, windows: &mut Windows) -> Result<()> {
     Ok(())
 }
 
-fn run_loop(stdout: &mut Stdout, mailboxes: Vec<Box<dyn Mailbox>>) -> Result<()> {
+fn run_loop(stdout: &mut Stdout, mailboxes: Vec<Mailbox>) -> Result<()> {
     let mut windows = Windows::new(stdout, mailboxes)?;
 
     // Initial draw
@@ -982,8 +753,8 @@ fn run_loop(stdout: &mut Stdout, mailboxes: Vec<Box<dyn Mailbox>>) -> Result<()>
     Ok(())
 }
 
-/// Run the inbox application with custom mailbox providers.
-pub fn run_with_mailboxes(mailboxes: Vec<Box<dyn Mailbox>>) -> Result<()> {
+/// Run the inbox application with mailboxes from an agent-inbox-protocol server.
+pub fn run_with_mailboxes(mailboxes: Vec<Mailbox>) -> Result<()> {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let mut out = stdout();
@@ -997,6 +768,13 @@ pub fn run_with_mailboxes(mailboxes: Vec<Box<dyn Mailbox>>) -> Result<()> {
     result?;
 
     Ok(())
+}
+
+/// Run the inbox application by fetching from an agent-inbox-protocol server.
+pub fn run_from_server(base_url: &str) -> Result<()> {
+    let mailboxes = fetch_mailboxes_blocking(base_url, QueryParameters::default())
+        .map_err(std::io::Error::other)?;
+    run_with_mailboxes(mailboxes)
 }
 
 /// Run the inbox application with sample data.

@@ -1,5 +1,5 @@
-use gui::RootWindow;
-use gui::WindowType;
+use labradormail::RootWindow;
+use labradormail::WindowType;
 
 #[test]
 fn root_window_accessors_return_expected_windows() {

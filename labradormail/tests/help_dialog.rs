@@ -1,7 +1,7 @@
-use gui::HelpData;
-use gui::HelpDialog;
-use gui::HelpItem;
-use gui::WindowType;
+use labradormail::HelpData;
+use labradormail::HelpDialog;
+use labradormail::HelpItem;
+use labradormail::WindowType;
 
 #[test]
 fn help_dialog_window_tree() {

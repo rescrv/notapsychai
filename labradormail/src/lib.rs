@@ -69,15 +69,22 @@ pub use help_bar::HelpBarWindowData;
 pub use help_data::HelpData;
 pub use help_data::HelpItem;
 pub use help_dialog::HelpDialog;
+pub use inbox::fetch_mailboxes_blocking;
 pub use inbox::run;
+pub use inbox::run_from_server;
 pub use inbox::run_with_mailboxes;
 pub use inbox::sample_mailbox_data;
-pub use inbox::InMemoryMailbox;
-pub use inbox::Mailbox;
-pub use inbox::MailboxError;
-pub use inbox::MailboxResult;
-pub use inbox::Message;
-pub use inbox::ThreadInfo;
+
+// Re-export agent-inbox-protocol types for convenience.
+pub use agent_inbox_protocol::Body;
+pub use agent_inbox_protocol::Client;
+pub use agent_inbox_protocol::From;
+pub use agent_inbox_protocol::Mailbox;
+pub use agent_inbox_protocol::MailboxName;
+pub use agent_inbox_protocol::MailboxProvider;
+pub use agent_inbox_protocol::Message;
+pub use agent_inbox_protocol::QueryParameters;
+pub use agent_inbox_protocol::QueryResult;
 pub use layout::IndexPagerLayout;
 pub use layout::IndexPagerLayoutConfig;
 pub use message_window::MessageWindow;
