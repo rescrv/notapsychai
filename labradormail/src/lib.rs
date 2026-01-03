@@ -72,11 +72,12 @@ pub use help_data::HelpItem;
 pub use help_dialog::HelpDialog;
 pub use inbox::fetch_mailboxes_blocking;
 pub use inbox::run;
-pub use inbox::run_from_server;
+pub use inbox::run_from_servers;
 pub use inbox::run_with_mailboxes;
 pub use inbox::sample_mailbox_data;
 
 // Re-export agent-inbox-protocol types for convenience.
+pub use agent_inbox_protocol::router;
 pub use agent_inbox_protocol::Body;
 pub use agent_inbox_protocol::Client;
 pub use agent_inbox_protocol::From;

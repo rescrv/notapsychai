@@ -20,6 +20,11 @@ use std::io::Stdout;
 use std::io::Write;
 use std::panic;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::TryRecvError;
+use std::thread;
+use std::time::Duration;
 
 use agent_inbox_protocol::Client;
 use agent_inbox_protocol::Mailbox;
@@ -28,6 +33,7 @@ use agent_inbox_protocol::Message;
 use agent_inbox_protocol::QueryParameters;
 use chrono::Utc;
 use crossterm::cursor::MoveTo;
+use crossterm::event::poll;
 use crossterm::event::read;
 use crossterm::event::Event;
 use crossterm::style::Print;
@@ -340,6 +346,48 @@ impl InboxState {
             );
             self.dirty.mark_mailbox_change();
         }
+    }
+
+    /// Updates the mailboxes with new data from a background refresh.
+    ///
+    /// Preserves the selected mailbox and message indices where possible.
+    fn update_mailboxes(&mut self, mailboxes: Vec<Mailbox>) {
+        // Store current selection state.
+        let current_mailbox_name = self
+            .mailbox_states
+            .get(self.selected_mailbox)
+            .map(|m| m.mailbox.name.as_str().to_string());
+        let current_message_idx = self
+            .mailbox_states
+            .get(self.selected_mailbox)
+            .map(|m| m.selected_message);
+
+        // Build new mailbox states.
+        self.mailbox_states = mailboxes.into_iter().map(MailboxState::new).collect();
+
+        // Restore selection if possible.
+        if let Some(name) = current_mailbox_name {
+            if let Some(idx) = self
+                .mailbox_states
+                .iter()
+                .position(|m| m.mailbox.name.as_str() == name)
+            {
+                self.selected_mailbox = idx;
+                if let Some(msg_idx) = current_message_idx {
+                    let max_idx = self.mailbox_states[idx]
+                        .visible_indices
+                        .len()
+                        .saturating_sub(1);
+                    self.mailbox_states[idx].selected_message = msg_idx.min(max_idx);
+                }
+            } else {
+                self.selected_mailbox = 0;
+            }
+        } else {
+            self.selected_mailbox = 0;
+        }
+
+        self.dirty.mark_all();
     }
 }
 
@@ -1041,6 +1089,154 @@ fn run_loop(stdout: &mut Stdout, mailboxes: Vec<Mailbox>) -> Result<()> {
     Ok(())
 }
 
+/// Interval between background refresh attempts.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Poll timeout for event loop.
+const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Spawn a background thread to fetch mailboxes from multiple servers.
+fn spawn_background_fetch(
+    base_urls: Vec<String>,
+) -> Receiver<std::result::Result<Vec<Mailbox>, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = fetch_mailboxes_from_urls(&base_urls);
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// Fetch mailboxes from multiple URLs and concatenate results.
+fn fetch_mailboxes_from_urls(base_urls: &[String]) -> std::result::Result<Vec<Mailbox>, String> {
+    let mut all_mailboxes = Vec::new();
+    let mut errors = Vec::new();
+
+    for base_url in base_urls {
+        match fetch_mailboxes_blocking(base_url, QueryParameters::default()) {
+            Ok(mailboxes) => all_mailboxes.extend(mailboxes),
+            Err(e) => errors.push(format!("{}: {}", base_url, e)),
+        }
+    }
+
+    if all_mailboxes.is_empty() && !errors.is_empty() {
+        Err(errors.join("; "))
+    } else {
+        Ok(all_mailboxes)
+    }
+}
+
+/// Run the event loop with periodic background refresh from multiple servers.
+fn run_loop_with_refresh(
+    stdout: &mut Stdout,
+    mailboxes: Vec<Mailbox>,
+    base_urls: &[String],
+) -> Result<()> {
+    let mut windows = Windows::new(stdout, mailboxes)?;
+
+    // Initial draw.
+    redraw(stdout, &mut windows)?;
+
+    // Track background fetch state.
+    let mut pending_fetch: Option<Receiver<std::result::Result<Vec<Mailbox>, String>>> = None;
+    let mut last_refresh = std::time::Instant::now();
+
+    loop {
+        let help_before = windows
+            .root
+            .all_dialogs()
+            .borrow()
+            .children
+            .last()
+            .map(|top| top.borrow().window_type == WindowType::DlgHelp)
+            .unwrap_or(false);
+
+        // Check for completed background fetch.
+        if let Some(ref rx) = pending_fetch {
+            match rx.try_recv() {
+                Ok(Ok(mailboxes)) => {
+                    windows.state_mut().update_mailboxes(mailboxes);
+                    windows.state_mut().status_message = "Refreshed mailboxes".to_string();
+                    windows.state().dirty.message.set(true);
+                    pending_fetch = None;
+                }
+                Ok(Err(e)) => {
+                    windows.state_mut().status_message = format!("Refresh failed: {}", e);
+                    windows.state().dirty.message.set(true);
+                    pending_fetch = None;
+                }
+                Err(TryRecvError::Empty) => {
+                    // Still fetching, continue.
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // Thread died unexpectedly.
+                    windows.state_mut().status_message =
+                        "Refresh failed: worker disconnected".to_string();
+                    windows.state().dirty.message.set(true);
+                    pending_fetch = None;
+                }
+            }
+        }
+
+        // Start a new background fetch if it's time and none is pending.
+        if pending_fetch.is_none() && last_refresh.elapsed() >= REFRESH_INTERVAL {
+            pending_fetch = Some(spawn_background_fetch(base_urls.to_vec()));
+            last_refresh = std::time::Instant::now();
+        }
+
+        // Poll for events with a timeout so we can check background fetches.
+        if poll(POLL_TIMEOUT)? {
+            match read()? {
+                Event::Key(key) => {
+                    let op = lookup_binding(dialog_default_bindings(), key)
+                        .or_else(|| lookup_binding(generic_default_bindings(), key));
+                    if let Some(op) = op {
+                        let ret = global_function_dispatcher_active(
+                            &windows.layout.dialog,
+                            &mut windows.ctx,
+                            op,
+                            &windows.global_functions,
+                        );
+                        if ret == FunctionRetval::Abort {
+                            break;
+                        }
+                        if ret != FunctionRetval::Unhandled {
+                            windows.state().dirty.help_bar.set(true);
+                        }
+                    }
+                }
+                Event::Resize(cols, rows) => {
+                    windows.handle_resize()?;
+                    let mut state = windows.state_mut();
+                    state.status_message = format!("Resized to {}x{}", cols, rows);
+                    state.dirty.mark_all();
+                }
+                Event::Mouse(_) => {}
+                Event::FocusGained => {}
+                Event::FocusLost => {}
+                Event::Paste(_) => {}
+            }
+        }
+
+        let help_after = windows
+            .root
+            .all_dialogs()
+            .borrow()
+            .children
+            .last()
+            .map(|top| top.borrow().window_type == WindowType::DlgHelp)
+            .unwrap_or(false);
+        if help_before != help_after {
+            windows.state().dirty.mark_all();
+        }
+
+        // Redraw only what changed.
+        redraw(stdout, &mut windows)?;
+    }
+
+    Ok(())
+}
+
 /// Run the inbox application with mailboxes from an agent-inbox-protocol server.
 pub fn run_with_mailboxes(mailboxes: Vec<Mailbox>) -> Result<()> {
     let default_hook = panic::take_hook();
@@ -1058,11 +1254,26 @@ pub fn run_with_mailboxes(mailboxes: Vec<Mailbox>) -> Result<()> {
     Ok(())
 }
 
-/// Run the inbox application by fetching from an agent-inbox-protocol server.
-pub fn run_from_server(base_url: &str) -> Result<()> {
-    let mailboxes = fetch_mailboxes_blocking(base_url, QueryParameters::default())
-        .map_err(std::io::Error::other)?;
-    run_with_mailboxes(mailboxes)
+/// Run the inbox application by fetching from multiple agent-inbox-protocol servers.
+///
+/// Fetches mailboxes initially from all servers, then periodically refreshes in the
+/// background without blocking the event loop.
+pub fn run_from_servers(base_urls: &[String]) -> Result<()> {
+    let mailboxes = fetch_mailboxes_from_urls(base_urls).map_err(std::io::Error::other)?;
+
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let mut out = stdout();
+        let _ = RootWindow::cleanup(&mut out);
+        default_hook(info);
+    }));
+
+    let mut stdout = stdout();
+    let result = run_loop_with_refresh(&mut stdout, mailboxes, base_urls);
+    let _ = RootWindow::cleanup(&mut stdout);
+    result?;
+
+    Ok(())
 }
 
 /// Run the inbox application with sample data.
