@@ -26,12 +26,15 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
 
+use agent_inbox_protocol::ActionRequest;
 use agent_inbox_protocol::Client;
 use agent_inbox_protocol::Mailbox;
 use agent_inbox_protocol::MailboxName;
 use agent_inbox_protocol::MailboxProvider;
 use agent_inbox_protocol::Message;
+use agent_inbox_protocol::MessageId;
 use agent_inbox_protocol::QueryParameters;
+use agent_inbox_protocol::Verb;
 use chrono::Utc;
 use crossterm::cursor::MoveTo;
 use crossterm::event::poll;
@@ -147,6 +150,8 @@ const SCROLLOFF: usize = 3;
 #[derive(Clone)]
 struct MailboxState {
     mailbox: Mailbox,
+    /// Source base URLs for each message (parallel to mailbox.messages).
+    message_sources: Vec<String>,
     selected_message: usize,
     scroll_offset: usize,
     visible_indices: Vec<usize>,
@@ -157,6 +162,19 @@ impl MailboxState {
     fn new(mailbox: Mailbox) -> Self {
         let count = mailbox.messages.len();
         Self {
+            message_sources: vec![String::new(); count],
+            mailbox,
+            selected_message: 0,
+            scroll_offset: 0,
+            visible_indices: (0..count).collect(),
+            filter_pattern: None,
+        }
+    }
+
+    fn new_with_sources(mailbox: Mailbox, sources: Vec<String>) -> Self {
+        let count = mailbox.messages.len();
+        Self {
+            message_sources: sources,
             mailbox,
             selected_message: 0,
             scroll_offset: 0,
@@ -269,6 +287,29 @@ impl InboxState {
         }
     }
 
+    fn new_with_states(mailbox_states: Vec<MailboxState>) -> Self {
+        Self {
+            selected_mailbox: 0,
+            mailbox_states,
+            status_message:
+                "Welcome! Press 'q' to quit, j/k to navigate messages, J/K for mailboxes."
+                    .to_string(),
+            dirty: DirtyFlags::new(),
+        }
+    }
+
+    /// Returns the currently selected message and its source base URL.
+    fn current_message_with_source(&self) -> Option<(&Message, &str)> {
+        let mailbox = self.current_mailbox();
+        if mailbox.visible_indices.is_empty() {
+            return None;
+        }
+        let actual_idx = mailbox.visible_indices[mailbox.selected_message];
+        let message = &mailbox.mailbox.messages[actual_idx];
+        let source = &mailbox.message_sources[actual_idx];
+        Some((message, source))
+    }
+
     fn select_next_message(&mut self) {
         let mailbox = self.current_mailbox_mut();
         if !mailbox.visible_indices.is_empty()
@@ -375,7 +416,7 @@ impl InboxState {
     /// Updates the mailboxes with new data from a background refresh.
     ///
     /// Preserves the selected mailbox and message indices where possible.
-    fn update_mailboxes(&mut self, mailboxes: Vec<Mailbox>) {
+    fn update_mailboxes(&mut self, mailbox_states: Vec<MailboxState>) {
         // Store current selection state.
         let current_mailbox_name = self
             .mailbox_states
@@ -386,8 +427,8 @@ impl InboxState {
             .get(self.selected_mailbox)
             .map(|m| m.selected_message);
 
-        // Build new mailbox states.
-        self.mailbox_states = mailboxes.into_iter().map(MailboxState::new).collect();
+        // Update mailbox states.
+        self.mailbox_states = mailbox_states;
 
         // Restore selection if possible.
         if let Some(name) = current_mailbox_name {
@@ -425,22 +466,28 @@ pub fn sample_mailbox_data() -> Vec<Mailbox> {
         name: MailboxName::new("INBOX").expect("valid mailbox name"),
         messages: vec![
             Message {
+                msg_id: MessageId::default(),
                 date: Utc::now(),
                 from: From::new("alice@example.com").expect("valid from"),
                 body: Body::new("Hello World").expect("valid body"),
                 wrap: false,
+                actions: vec![],
             },
             Message {
+                msg_id: MessageId::default(),
                 date: Utc::now(),
                 from: From::new("bob@example.com").expect("valid from"),
                 body: Body::new("Re: Hello World").expect("valid body"),
                 wrap: false,
+                actions: vec![],
             },
             Message {
+                msg_id: MessageId::default(),
                 date: Utc::now(),
                 from: From::new("charlie@example.com").expect("valid from"),
                 body: Body::new("Project Update").expect("valid body"),
                 wrap: false,
+                actions: vec![],
             },
         ],
     };
@@ -449,16 +496,20 @@ pub fn sample_mailbox_data() -> Vec<Mailbox> {
         name: MailboxName::new("Sent").expect("valid mailbox name"),
         messages: vec![
             Message {
+                msg_id: MessageId::default(),
                 date: Utc::now(),
                 from: From::new("me@example.com").expect("valid from"),
                 body: Body::new("Re: Hello World").expect("valid body"),
                 wrap: false,
+                actions: vec![],
             },
             Message {
+                msg_id: MessageId::default(),
                 date: Utc::now(),
                 from: From::new("me@example.com").expect("valid from"),
                 body: Body::new("Meeting Tomorrow").expect("valid body"),
                 wrap: false,
+                actions: vec![],
             },
         ],
     };
@@ -466,20 +517,24 @@ pub fn sample_mailbox_data() -> Vec<Mailbox> {
     let drafts = Mailbox {
         name: MailboxName::new("Drafts").expect("valid mailbox name"),
         messages: vec![Message {
+            msg_id: MessageId::default(),
             date: Utc::now(),
             from: From::new("me@example.com").expect("valid from"),
             body: Body::new("Draft: Proposal").expect("valid body"),
             wrap: false,
+            actions: vec![],
         }],
     };
 
     let trash = Mailbox {
         name: MailboxName::new("Trash").expect("valid mailbox name"),
         messages: vec![Message {
+            msg_id: MessageId::default(),
             date: Utc::now(),
             from: From::new("spam@example.com").expect("valid from"),
             body: Body::new("You've won!").expect("valid body"),
             wrap: false,
+            actions: vec![],
         }],
     };
 
@@ -685,6 +740,86 @@ fn op_mail(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> Function
     FunctionRetval::Done
 }
 
+/// Executes an action request against a server.
+fn execute_action_blocking(
+    base_url: &str,
+    message_id: MessageId,
+    verb: Verb,
+) -> std::result::Result<String, String> {
+    let mut client = Client::new(base_url);
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
+
+    let request = ActionRequest { message_id, verb };
+
+    runtime.block_on(async {
+        let response = client
+            .action(request)
+            .await
+            .map_err(|e| format!("action request failed: {}", e))?;
+
+        if response.success {
+            Ok(response.message.unwrap_or_else(|| "Action completed".to_string()))
+        } else {
+            Err(response.message.unwrap_or_else(|| "Action failed".to_string()))
+        }
+    })
+}
+
+/// Handles action shortcut key presses.
+///
+/// Returns true if the key matched an action shortcut and was handled.
+fn handle_action_shortcut(windows: &mut Windows, key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyCode;
+
+    // Only handle single character keys for shortcuts.
+    let shortcut_char = match key.code {
+        KeyCode::Char(c) => c.to_string(),
+        _ => return false,
+    };
+
+    // Get current message and its source.
+    let state = windows.state();
+    let Some((message, source_url)) = state.current_message_with_source() else {
+        return false;
+    };
+
+    // Skip if no source URL (e.g., sample data without server).
+    if source_url.is_empty() {
+        return false;
+    }
+
+    // Find matching action by shortcut.
+    let matching_action = message
+        .actions
+        .iter()
+        .find(|action| action.shortcut.as_deref() == Some(&shortcut_char));
+
+    let Some(action) = matching_action else {
+        return false;
+    };
+
+    // Clone what we need before dropping the borrow.
+    let verb = action.verb.clone();
+    let label = action.label.clone();
+    let message_id = message.msg_id.clone();
+    let base_url = source_url.to_string();
+    drop(state);
+
+    // Execute the action.
+    match execute_action_blocking(&base_url, message_id, verb) {
+        Ok(msg) => {
+            windows.state_mut().status_message = format!("{}: {}", label, msg);
+        }
+        Err(e) => {
+            windows.state_mut().status_message = format!("{} failed: {}", label, e);
+        }
+    }
+    windows.state().dirty.message.set(true);
+
+    true
+}
+
 /// Inbox-specific global functions for navigation.
 fn inbox_global_functions() -> Vec<GlobalFunctionEntry> {
     let mut funcs: Vec<GlobalFunctionEntry> = default_global_functions().to_vec();
@@ -833,12 +968,36 @@ fn draw_pager(
     }
 
     let message = &data.messages[data.selected_message];
-    let lines = [
+
+    // Build actions line if there are actions.
+    let actions_line = if message.actions.is_empty() {
+        String::new()
+    } else {
+        let action_strs: Vec<String> = message
+            .actions
+            .iter()
+            .map(|a| {
+                if let Some(ref shortcut) = a.shortcut {
+                    format!("[{}] {}", shortcut, a.label)
+                } else {
+                    a.label.clone()
+                }
+            })
+            .collect();
+        format!("Actions: {}", action_strs.join("  "))
+    };
+
+    let mut lines = vec![
         format!("From: {}", message.from.as_str()),
         format!("Date: {}", message.date.format("%Y-%m-%d %H:%M:%S")),
-        String::new(),
-        message.body.as_str().to_string(),
     ];
+
+    if !actions_line.is_empty() {
+        lines.push(actions_line);
+    }
+
+    lines.push(String::new());
+    lines.push(message.body.as_str().to_string());
 
     for row in 0u16..(win.state.rows.try_into().expect("positive i16 to fit u16")) {
         move_to_row(out, win, row)?;
@@ -909,6 +1068,43 @@ impl Windows {
         {
             let mut dlg_win = layout.dialog.borrow_mut();
             dlg_win.wdata = Some(Box::new(InboxState::new(mailboxes)));
+        }
+
+        let global_functions = inbox_global_functions();
+
+        MuttWindow::add_child(root.all_dialogs(), Rc::clone(&layout.dialog));
+
+        // Initial reflow
+        window_reflow(root.root());
+
+        let help_bar = Rc::clone(root.help_bar());
+        let message_container = Rc::clone(root.message_container());
+
+        Ok(Self {
+            root,
+            ctx,
+            layout,
+            help_bar,
+            message_container,
+            global_functions,
+        })
+    }
+
+    fn new_with_states(stdout: &mut Stdout, mailbox_states: Vec<MailboxState>) -> Result<Self> {
+        let mut ctx = GuiContext::new();
+        let root = RootWindow::new(stdout)?;
+        ctx.register_root_window(root.root());
+        let help_data = Rc::new(HelpData::from_items(vec![
+            HelpItem::new("q", "Quit"),
+            HelpItem::new("j/k", "Navigate"),
+            HelpItem::new("J/K", "Mailbox"),
+            HelpItem::new("?", "Help"),
+        ]));
+
+        let layout = IndexPagerLayout::new(WindowType::DlgIndex, Some(help_data));
+        {
+            let mut dlg_win = layout.dialog.borrow_mut();
+            dlg_win.wdata = Some(Box::new(InboxState::new_with_states(mailbox_states)));
         }
 
         let global_functions = inbox_global_functions();
@@ -1122,7 +1318,7 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// Spawn a background thread to fetch mailboxes from multiple servers.
 fn spawn_background_fetch(
     configs: Vec<ServerConfig>,
-) -> Receiver<std::result::Result<Vec<Mailbox>, String>> {
+) -> Receiver<std::result::Result<Vec<MailboxState>, String>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = fetch_and_merge_mailboxes(&configs);
@@ -1136,12 +1332,15 @@ fn spawn_background_fetch(
 /// For servers with `merge=true`, mailboxes retain their original names and are merged
 /// with same-named mailboxes from other merge sources. For servers with `merge=false`,
 /// mailbox names are prefixed with the service name (e.g., "Work/INBOX").
+///
+/// Returns `MailboxState` instances that track the source base URL for each message.
 fn fetch_and_merge_mailboxes(
     configs: &[ServerConfig],
-) -> std::result::Result<Vec<Mailbox>, String> {
+) -> std::result::Result<Vec<MailboxState>, String> {
     use std::collections::HashMap;
 
-    let mut merged: HashMap<String, Mailbox> = HashMap::new();
+    // Track mailbox data and sources together.
+    let mut merged: HashMap<String, (Mailbox, Vec<String>)> = HashMap::new();
     let mut errors = Vec::new();
 
     for config in configs {
@@ -1154,9 +1353,13 @@ fn fetch_and_merge_mailboxes(
                         format!("{}/{}", config.name, mailbox.name.as_str())
                     };
 
-                    if let Some(existing) = merged.get_mut(&name) {
-                        // Merge messages into existing mailbox.
-                        existing.messages.extend(mailbox.messages);
+                    let message_count = mailbox.messages.len();
+                    let sources = vec![config.base_url.clone(); message_count];
+
+                    if let Some((existing_mailbox, existing_sources)) = merged.get_mut(&name) {
+                        // Merge messages and sources into existing mailbox.
+                        existing_mailbox.messages.extend(mailbox.messages);
+                        existing_sources.extend(sources);
                     } else {
                         // Create new mailbox with the (possibly prefixed) name.
                         let new_name = MailboxName::new(&name).unwrap_or(mailbox.name.clone());
@@ -1164,7 +1367,7 @@ fn fetch_and_merge_mailboxes(
                             name: new_name,
                             messages: mailbox.messages,
                         };
-                        merged.insert(name, new_mailbox);
+                        merged.insert(name, (new_mailbox, sources));
                     }
                 }
             }
@@ -1176,25 +1379,31 @@ fn fetch_and_merge_mailboxes(
         Err(errors.join("; "))
     } else {
         // Sort mailboxes by name for consistent ordering.
-        let mut mailboxes: Vec<Mailbox> = merged.into_values().collect();
-        mailboxes.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        Ok(mailboxes)
+        let mut items: Vec<(String, (Mailbox, Vec<String>))> = merged.into_iter().collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mailbox_states = items
+            .into_iter()
+            .map(|(_, (mailbox, sources))| MailboxState::new_with_sources(mailbox, sources))
+            .collect();
+
+        Ok(mailbox_states)
     }
 }
 
 /// Run the event loop with periodic background refresh from multiple servers.
 fn run_loop_with_refresh(
     stdout: &mut Stdout,
-    mailboxes: Vec<Mailbox>,
+    mailbox_states: Vec<MailboxState>,
     configs: &[ServerConfig],
 ) -> Result<()> {
-    let mut windows = Windows::new(stdout, mailboxes)?;
+    let mut windows = Windows::new_with_states(stdout, mailbox_states)?;
 
     // Initial draw.
     redraw(stdout, &mut windows)?;
 
     // Track background fetch state.
-    let mut pending_fetch: Option<Receiver<std::result::Result<Vec<Mailbox>, String>>> = None;
+    let mut pending_fetch: Option<Receiver<std::result::Result<Vec<MailboxState>, String>>> = None;
     let mut last_refresh = std::time::Instant::now();
 
     loop {
@@ -1210,8 +1419,8 @@ fn run_loop_with_refresh(
         // Check for completed background fetch.
         if let Some(ref rx) = pending_fetch {
             match rx.try_recv() {
-                Ok(Ok(mailboxes)) => {
-                    windows.state_mut().update_mailboxes(mailboxes);
+                Ok(Ok(mailbox_states)) => {
+                    windows.state_mut().update_mailboxes(mailbox_states);
                     windows.state_mut().status_message = "Refreshed mailboxes".to_string();
                     windows.state().dirty.message.set(true);
                     pending_fetch = None;
@@ -1244,20 +1453,25 @@ fn run_loop_with_refresh(
         if poll(POLL_TIMEOUT)? {
             match read()? {
                 Event::Key(key) => {
-                    let op = lookup_binding(dialog_default_bindings(), key)
-                        .or_else(|| lookup_binding(generic_default_bindings(), key));
-                    if let Some(op) = op {
-                        let ret = global_function_dispatcher_active(
-                            &windows.layout.dialog,
-                            &mut windows.ctx,
-                            op,
-                            &windows.global_functions,
-                        );
-                        if ret == FunctionRetval::Abort {
-                            break;
-                        }
-                        if ret != FunctionRetval::Unhandled {
-                            windows.state().dirty.help_bar.set(true);
+                    // First check for action shortcuts on the current message.
+                    if handle_action_shortcut(&mut windows, key) {
+                        // Action was handled.
+                    } else {
+                        let op = lookup_binding(dialog_default_bindings(), key)
+                            .or_else(|| lookup_binding(generic_default_bindings(), key));
+                        if let Some(op) = op {
+                            let ret = global_function_dispatcher_active(
+                                &windows.layout.dialog,
+                                &mut windows.ctx,
+                                op,
+                                &windows.global_functions,
+                            );
+                            if ret == FunctionRetval::Abort {
+                                break;
+                            }
+                            if ret != FunctionRetval::Unhandled {
+                                windows.state().dirty.help_bar.set(true);
+                            }
                         }
                     }
                 }
@@ -1317,7 +1531,7 @@ pub fn run_with_mailboxes(mailboxes: Vec<Mailbox>) -> Result<()> {
 /// are combined at the top level, while servers with `merge=false` have their mailboxes
 /// prefixed with the service name.
 pub fn run_from_servers(configs: &[ServerConfig]) -> Result<()> {
-    let mailboxes = fetch_and_merge_mailboxes(configs).map_err(std::io::Error::other)?;
+    let mailbox_states = fetch_and_merge_mailboxes(configs).map_err(std::io::Error::other)?;
 
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -1327,7 +1541,7 @@ pub fn run_from_servers(configs: &[ServerConfig]) -> Result<()> {
     }));
 
     let mut stdout = stdout();
-    let result = run_loop_with_refresh(&mut stdout, mailboxes, configs);
+    let result = run_loop_with_refresh(&mut stdout, mailbox_states, configs);
     let _ = RootWindow::cleanup(&mut stdout);
     result?;
 
@@ -1349,10 +1563,12 @@ mod tests {
     fn make_test_mailbox(num_messages: usize) -> Mailbox {
         let messages: Vec<Message> = (0..num_messages)
             .map(|i| Message {
+                msg_id: MessageId::default(),
                 date: Utc::now(),
                 from: From::new(format!("user{}@example.com", i)).expect("valid from"),
                 body: Body::new(format!("Message {}", i)).expect("valid body"),
                 wrap: false,
+                actions: vec![],
             })
             .collect();
         Mailbox {
