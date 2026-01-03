@@ -108,11 +108,15 @@ impl DirtyFlags {
     }
 }
 
+/// Number of lines to keep between cursor and edge of viewport (like Vim's scrolloff).
+const SCROLLOFF: usize = 3;
+
 /// Internal mailbox state used by the inbox.
 #[derive(Clone)]
 struct MailboxState {
     mailbox: Mailbox,
     selected_message: usize,
+    scroll_offset: usize,
 }
 
 impl MailboxState {
@@ -120,6 +124,7 @@ impl MailboxState {
         Self {
             mailbox,
             selected_message: 0,
+            scroll_offset: 0,
         }
     }
 }
@@ -129,6 +134,7 @@ impl MailboxState {
 struct RenderData {
     selected_mailbox: usize,
     selected_message: usize,
+    scroll_offset: usize,
     mailbox_names: Vec<String>,
     messages: Vec<Message>,
     status_message: String,
@@ -149,6 +155,7 @@ impl InboxState {
         RenderData {
             selected_mailbox: self.selected_mailbox,
             selected_message: mailbox_state.selected_message,
+            scroll_offset: mailbox_state.scroll_offset,
             mailbox_names: self
                 .mailbox_states
                 .iter()
@@ -203,6 +210,54 @@ impl InboxState {
                 self.current_mailbox().selected_message + 1
             );
             self.dirty.mark_message_views();
+        }
+    }
+
+    /// Updates the scroll offset for the current mailbox based on viewport height.
+    ///
+    /// Implements scrolloff behavior: maintains SCROLLOFF lines between the cursor and
+    /// the bottom of the viewport, except when the cursor is in the last SCROLLOFF
+    /// messages of the list (where it's allowed to approach the bottom edge).
+    fn update_scroll_offset(&mut self, viewport_height: usize) {
+        let mailbox = self.current_mailbox_mut();
+        let selected = mailbox.selected_message;
+        let total = mailbox.mailbox.messages.len();
+        let scroll = &mut mailbox.scroll_offset;
+
+        if total == 0 || viewport_height == 0 {
+            *scroll = 0;
+            return;
+        }
+
+        // Maximum scroll position (can't scroll past the end).
+        let max_scroll = total.saturating_sub(viewport_height);
+
+        // If cursor is above the viewport, scroll up to show it.
+        if selected < *scroll {
+            *scroll = selected;
+        }
+
+        // If cursor is at or past the bottom edge of viewport, scroll down to show it.
+        let viewport_bottom = *scroll + viewport_height;
+        if selected >= viewport_bottom {
+            *scroll = selected.saturating_sub(viewport_height - 1);
+        }
+
+        // Apply scrolloff: ensure SCROLLOFF lines below cursor, unless we're near the end.
+        // The "ideal" bottom position for the cursor is viewport_height - 1 - SCROLLOFF
+        // rows from the top of viewport. If cursor is lower than that, scroll down.
+        let cursor_pos_in_viewport = selected.saturating_sub(*scroll);
+        let ideal_max_pos = viewport_height.saturating_sub(1 + SCROLLOFF);
+
+        if cursor_pos_in_viewport > ideal_max_pos {
+            // Need to scroll down, but only if doing so won't push us past max_scroll.
+            let adjustment = cursor_pos_in_viewport - ideal_max_pos;
+            *scroll = (*scroll + adjustment).min(max_scroll);
+        }
+
+        // Clamp scroll to valid range.
+        if *scroll > max_scroll {
+            *scroll = max_scroll;
         }
     }
 
@@ -429,19 +484,26 @@ fn draw_sidebar(
     Ok(())
 }
 
-/// Draws the message index.
+/// Draws the message index with scrolling support.
 fn draw_index(
     ctx: &mut GuiContext,
     out: &mut dyn Write,
     win: &MuttWindow,
     data: &RenderData,
 ) -> Result<()> {
-    for row in 0u16..(win.state.rows.try_into().expect("positive i16 to fit u16")) {
+    let viewport_height: usize = win
+        .state
+        .rows
+        .try_into()
+        .expect("positive i16 to fit usize");
+
+    for row in 0u16..(viewport_height as u16) {
         move_to_row(out, win, row)?;
 
-        if (row as usize) < data.messages.len() {
-            let msg = &data.messages[row as usize];
-            let is_selected = row as usize == data.selected_message;
+        let msg_index = data.scroll_offset + row as usize;
+        if msg_index < data.messages.len() {
+            let msg = &data.messages[msg_index];
+            let is_selected = msg_index == data.selected_message;
 
             if is_selected {
                 let selected = AttrColor::new(
@@ -626,6 +688,16 @@ fn redraw(stdout: &mut Stdout, windows: &mut Windows) -> Result<()> {
 
     if windows.state().dirty.index.get() {
         let win = windows.layout.index_window.borrow();
+        let viewport_height: usize = win
+            .state
+            .rows
+            .try_into()
+            .expect("positive i16 to fit usize");
+        drop(win);
+        windows.state_mut().update_scroll_offset(viewport_height);
+        // Re-extract render data after scroll offset update.
+        let render_data = windows.state().render_data();
+        let win = windows.layout.index_window.borrow();
         draw_index(&mut windows.ctx, stdout, &win, &render_data)?;
         windows.state().dirty.index.set(false);
     }
@@ -780,4 +852,143 @@ pub fn run_from_server(base_url: &str) -> Result<()> {
 /// Run the inbox application with sample data.
 pub fn run() -> Result<()> {
     run_with_mailboxes(sample_mailbox_data())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_inbox_protocol::Body;
+    use agent_inbox_protocol::From;
+    use agent_inbox_protocol::MailboxName;
+
+    fn make_test_mailbox(num_messages: usize) -> Mailbox {
+        let messages: Vec<Message> = (0..num_messages)
+            .map(|i| Message {
+                date: Utc::now(),
+                from: From::new(format!("user{}@example.com", i)).expect("valid from"),
+                body: Body::new(format!("Message {}", i)).expect("valid body"),
+                wrap: false,
+            })
+            .collect();
+        Mailbox {
+            name: MailboxName::new("Test").expect("valid name"),
+            messages,
+        }
+    }
+
+    #[test]
+    fn scrolloff_stays_at_top_when_selection_near_start() {
+        // With 10 messages and viewport of 5, SCROLLOFF=3.
+        // ideal_max_pos = 5 - 1 - 3 = 1, meaning cursor can be at row 0 or 1 without scrolling.
+        // Selecting message 0 or 1 keeps scroll at 0.
+        // Selecting message 2 would put cursor at row 2, which > ideal_max_pos=1, so scroll=1.
+        let mailbox = make_test_mailbox(10);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        state.update_scroll_offset(5);
+        assert_eq!(state.current_mailbox().scroll_offset, 0);
+        println!(
+            "selected=0, scroll_offset={}",
+            state.current_mailbox().scroll_offset
+        );
+
+        state.current_mailbox_mut().selected_message = 1;
+        state.update_scroll_offset(5);
+        assert_eq!(state.current_mailbox().scroll_offset, 0);
+        println!(
+            "selected=1, scroll_offset={}",
+            state.current_mailbox().scroll_offset
+        );
+
+        // Message 2 causes scroll because we need 3 lines below cursor.
+        state.current_mailbox_mut().selected_message = 2;
+        state.update_scroll_offset(5);
+        assert_eq!(state.current_mailbox().scroll_offset, 1);
+        println!(
+            "selected=2, scroll_offset={}",
+            state.current_mailbox().scroll_offset
+        );
+    }
+
+    #[test]
+    fn scrolloff_scrolls_when_cursor_approaches_bottom() {
+        // With 10 messages and viewport of 5, SCROLLOFF=3 means bottom_threshold = 5-3-1 = 1.
+        // Selecting message 3 with scroll_offset=0 means pos_in_viewport=3 > 1, so scroll should
+        // increase.
+        let mailbox = make_test_mailbox(10);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        state.current_mailbox_mut().selected_message = 4;
+        state.update_scroll_offset(5);
+        // pos_in_viewport = 4 - 0 = 4, bottom_threshold = 5 - 3 - 1 = 1
+        // overshoot = 4 - 1 = 3, so scroll = 0 + 3 = 3
+        // But then we need selected=4 to be at pos 1 in viewport: 4 - 3 = 1. Good.
+        println!(
+            "selected=4, scroll_offset={}",
+            state.current_mailbox().scroll_offset
+        );
+        assert!(state.current_mailbox().scroll_offset > 0);
+    }
+
+    #[test]
+    fn scrolloff_does_not_scroll_past_end() {
+        // With 10 messages and viewport of 5, max_scroll = 10 - 5 = 5.
+        let mailbox = make_test_mailbox(10);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        state.current_mailbox_mut().selected_message = 9;
+        state.update_scroll_offset(5);
+        // max_scroll = 10 - 5 = 5
+        println!(
+            "selected=9, scroll_offset={}",
+            state.current_mailbox().scroll_offset
+        );
+        assert!(state.current_mailbox().scroll_offset <= 5);
+    }
+
+    #[test]
+    fn scrolloff_handles_small_list() {
+        // With 3 messages and viewport of 10, no scrolling needed.
+        let mailbox = make_test_mailbox(3);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        state.current_mailbox_mut().selected_message = 2;
+        state.update_scroll_offset(10);
+        assert_eq!(state.current_mailbox().scroll_offset, 0);
+        println!(
+            "selected=2, scroll_offset={}",
+            state.current_mailbox().scroll_offset
+        );
+    }
+
+    #[test]
+    fn scrolloff_handles_empty_mailbox() {
+        let mailbox = make_test_mailbox(0);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        state.update_scroll_offset(5);
+        assert_eq!(state.current_mailbox().scroll_offset, 0);
+    }
+
+    #[test]
+    fn scrolloff_scrolls_up_when_moving_back() {
+        // Simulate scrolling down then back up.
+        let mailbox = make_test_mailbox(20);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        // Scroll down to message 10.
+        state.current_mailbox_mut().selected_message = 10;
+        state.update_scroll_offset(5);
+        let scroll_at_10 = state.current_mailbox().scroll_offset;
+        println!("selected=10, scroll_offset={}", scroll_at_10);
+
+        // Now move back to message 5.
+        state.current_mailbox_mut().selected_message = 5;
+        state.update_scroll_offset(5);
+        let scroll_at_5 = state.current_mailbox().scroll_offset;
+        println!("selected=5, scroll_offset={}", scroll_at_5);
+
+        // Scroll should have decreased.
+        assert!(scroll_at_5 < scroll_at_10);
+    }
 }
