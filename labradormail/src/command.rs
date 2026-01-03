@@ -17,7 +17,7 @@ pub enum CommandAction {
 
 /// Parses a command string into an action.
 pub fn parse_command(cmd: &str) -> CommandAction {
-    let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() {
         return CommandAction::Empty;
     }
@@ -40,7 +40,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
             }
         }
         "exec" => {
-             if parts.len() < 2 {
+            if parts.len() < 2 {
                 return CommandAction::Unknown("exec requires an opcode name".to_string());
             }
             // TODO: Lookup opcode by name

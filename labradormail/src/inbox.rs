@@ -30,40 +30,36 @@ use chrono::Utc;
 use crossterm::cursor::MoveTo;
 use crossterm::event::read;
 use crossterm::event::Event;
-use crossterm::style::Attribute;
-use crossterm::style::Color;
 use crossterm::style::Print;
 use crossterm::ExecutableCommand;
 
 use crate::command::parse_command;
 use crate::command::CommandAction;
+use crate::context::GuiContext;
 use crate::default_global_functions;
 use crate::dialog_default_bindings;
 use crate::generic_default_bindings;
 use crate::global_function_dispatcher_active;
 use crate::lookup_binding;
-use crate::mw_enter_fname;
-use crate::mutt_curses_set_color;
+use crate::mutt_curses::ColorId;
 use crate::mutt_curses_set_color_by_id;
 use crate::mutt_curses_set_normal_backed_color_by_id;
 use crate::mutt_resize_screen;
+use crate::mw_enter_fname;
+use crate::opcodes::OpCode;
+use crate::window::MuttWindow;
+use crate::window::WindowActionFlags;
+use crate::window::WindowType;
 use crate::window_reflow;
 use crate::window_status_on_top;
-use crate::AttrColor;
-use crate::ColorId;
 use crate::FileCompletionData;
 use crate::FunctionRetval;
 use crate::GlobalFunctionEntry;
-use crate::GuiContext;
 use crate::HelpData;
 use crate::HelpItem;
 use crate::IndexPagerLayout;
-use crate::MuttWindow;
-use crate::OpCode;
 use crate::RootWindow;
 use crate::SelectFileFlags;
-use crate::WindowActionFlags;
-use crate::WindowType;
 
 /// Dirty flags for selective redrawing.
 #[derive(Default)]
@@ -216,10 +212,15 @@ impl InboxState {
     }
 
     fn search(&mut self, pattern: String) {
-        self.current_mailbox_mut().apply_filter(if pattern.is_empty() { None } else { Some(pattern) });
+        self.current_mailbox_mut()
+            .apply_filter(if pattern.is_empty() {
+                None
+            } else {
+                Some(pattern)
+            });
         self.dirty.mark_message_views();
     }
-    
+
     fn clear_search(&mut self) {
         self.current_mailbox_mut().apply_filter(None);
         self.dirty.mark_message_views();
@@ -464,11 +465,11 @@ fn op_sidebar_prev(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> 
 }
 
 /// Global function handler for EnterCommand (:).
-fn op_enter_command(win: &mut MuttWindow, ctx: &mut GuiContext, _op: OpCode) -> FunctionRetval {
+fn op_enter_command(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> FunctionRetval {
     // We need to access the message window which is usually at the root level.
     // Since we don't have direct access to MessageWindow here, we'll just use stdout directly
     // and rely on mw_enter_fname to handle the UI at the cursor position.
-    
+
     let mut stdout = std::io::stdout();
     // Move to bottom left
     let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -500,7 +501,7 @@ fn op_enter_command(win: &mut MuttWindow, ctx: &mut GuiContext, _op: OpCode) -> 
                         let root = MuttWindow::get_root(&parent);
                         let is_top = value == "yes" || value == "true" || value == "1";
                         window_status_on_top(&root, is_top);
-                        
+
                         // Update status message
                         if let Some(state) = win.wdata_mut::<InboxState>() {
                             state.status_message = format!("Set status_on_top = {}", is_top);
@@ -509,19 +510,19 @@ fn op_enter_command(win: &mut MuttWindow, ctx: &mut GuiContext, _op: OpCode) -> 
                         return FunctionRetval::Done;
                     }
                 }
-                 if let Some(state) = win.wdata_mut::<InboxState>() {
+                if let Some(state) = win.wdata_mut::<InboxState>() {
                     state.status_message = format!("Unknown option: {}", key);
                     state.dirty.message.set(true);
                 }
             }
             CommandAction::Op(op) => {
-                  if let Some(state) = win.wdata_mut::<InboxState>() {
+                if let Some(state) = win.wdata_mut::<InboxState>() {
                     state.status_message = format!("Command opcode: {:?}", op);
                     state.dirty.message.set(true);
                 }
             }
             CommandAction::Unknown(cmd) => {
-                 if let Some(state) = win.wdata_mut::<InboxState>() {
+                if let Some(state) = win.wdata_mut::<InboxState>() {
                     state.status_message = format!("Unknown command: {}", cmd);
                     state.dirty.message.set(true);
                 }
@@ -556,14 +557,17 @@ fn op_search(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> Functi
 
     if let Ok(0) = ret {
         if let Some(state) = win.wdata_mut::<InboxState>() {
-             if pattern.is_empty() {
-                 state.clear_search();
-                 state.status_message = "Search cleared".to_string();
-             } else {
-                 state.search(pattern);
-                 state.status_message = format!("Searching for: {}", state.current_mailbox().filter_pattern.as_ref().unwrap());
-             }
-             state.dirty.message.set(true);
+            if pattern.is_empty() {
+                state.clear_search();
+                state.status_message = "Search cleared".to_string();
+            } else {
+                state.search(pattern);
+                state.status_message = format!(
+                    "Searching for: {}",
+                    state.current_mailbox().filter_pattern.as_ref().unwrap()
+                );
+            }
+            state.dirty.message.set(true);
         }
     }
 
@@ -589,15 +593,16 @@ fn op_mail(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> Function
         &mut completion,
         SelectFileFlags::NONE,
     ) {
-         if let Ok(0) = mw_enter_fname(
+        if let Ok(0) = mw_enter_fname(
             &mut stdout,
             "Subject:",
             &mut subject,
             &mut completion,
             SelectFileFlags::NONE,
         ) {
-             if let Some(state) = win.wdata_mut::<InboxState>() {
-                state.status_message = format!("Sent mail to '{}' with subject '{}'", to_addr, subject);
+            if let Some(state) = win.wdata_mut::<InboxState>() {
+                state.status_message =
+                    format!("Sent mail to '{}' with subject '{}'", to_addr, subject);
                 state.dirty.message.set(true);
             }
         }
@@ -911,7 +916,7 @@ fn redraw(stdout: &mut Stdout, windows: &mut Windows) -> Result<()> {
         let mailbox_name = &render_data.mailbox_names[render_data.selected_mailbox];
         let msg_count = render_data.messages.len();
         let filter_status = if let Some(ref pat) = render_data.filter_pattern {
-             format!(" [Limit: {}]", pat)
+            format!(" [Limit: {}]", pat)
         } else {
             String::new()
         };

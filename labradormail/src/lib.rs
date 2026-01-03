@@ -4,8 +4,8 @@
 //! This crate provides a hierarchical window management system with automatic layout (reflow),
 //! notification-based updates, focus management, and dialog stacking.
 
-mod context;
 mod command;
+mod context;
 mod curs_lib;
 mod dialog;
 mod global;
