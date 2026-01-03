@@ -5,6 +5,7 @@
 //! notification-based updates, focus management, and dialog stacking.
 
 mod context;
+mod command;
 mod curs_lib;
 mod dialog;
 mod global;

@@ -35,18 +35,23 @@ use crossterm::style::Color;
 use crossterm::style::Print;
 use crossterm::ExecutableCommand;
 
+use crate::command::parse_command;
+use crate::command::CommandAction;
 use crate::default_global_functions;
 use crate::dialog_default_bindings;
 use crate::generic_default_bindings;
 use crate::global_function_dispatcher_active;
 use crate::lookup_binding;
+use crate::mw_enter_fname;
 use crate::mutt_curses_set_color;
 use crate::mutt_curses_set_color_by_id;
 use crate::mutt_curses_set_normal_backed_color_by_id;
 use crate::mutt_resize_screen;
 use crate::window_reflow;
+use crate::window_status_on_top;
 use crate::AttrColor;
 use crate::ColorId;
+use crate::FileCompletionData;
 use crate::FunctionRetval;
 use crate::GlobalFunctionEntry;
 use crate::GuiContext;
@@ -56,6 +61,7 @@ use crate::IndexPagerLayout;
 use crate::MuttWindow;
 use crate::OpCode;
 use crate::RootWindow;
+use crate::SelectFileFlags;
 use crate::WindowActionFlags;
 use crate::WindowType;
 
@@ -117,15 +123,42 @@ struct MailboxState {
     mailbox: Mailbox,
     selected_message: usize,
     scroll_offset: usize,
+    visible_indices: Vec<usize>,
+    filter_pattern: Option<String>,
 }
 
 impl MailboxState {
     fn new(mailbox: Mailbox) -> Self {
+        let count = mailbox.messages.len();
         Self {
             mailbox,
             selected_message: 0,
             scroll_offset: 0,
+            visible_indices: (0..count).collect(),
+            filter_pattern: None,
         }
+    }
+
+    fn apply_filter(&mut self, pattern: Option<String>) {
+        self.filter_pattern = pattern.clone();
+        if let Some(pat) = pattern {
+            let pat = pat.to_lowercase();
+            self.visible_indices = self
+                .mailbox
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, msg)| {
+                    msg.from.as_str().to_lowercase().contains(&pat)
+                        || msg.body.as_str().to_lowercase().contains(&pat)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        } else {
+            self.visible_indices = (0..self.mailbox.messages.len()).collect();
+        }
+        self.selected_message = 0;
+        self.scroll_offset = 0;
     }
 }
 
@@ -138,6 +171,7 @@ struct RenderData {
     mailbox_names: Vec<String>,
     messages: Vec<Message>,
     status_message: String,
+    filter_pattern: Option<String>,
 }
 
 /// Inbox state.
@@ -152,6 +186,12 @@ impl InboxState {
     /// Extracts render data for drawing.
     fn render_data(&self) -> RenderData {
         let mailbox_state = &self.mailbox_states[self.selected_mailbox];
+        let messages: Vec<Message> = mailbox_state
+            .visible_indices
+            .iter()
+            .map(|&idx| mailbox_state.mailbox.messages[idx].clone())
+            .collect();
+
         RenderData {
             selected_mailbox: self.selected_mailbox,
             selected_message: mailbox_state.selected_message,
@@ -161,8 +201,9 @@ impl InboxState {
                 .iter()
                 .map(|m| m.mailbox.name.as_str().to_string())
                 .collect(),
-            messages: mailbox_state.mailbox.messages.clone(),
+            messages,
             status_message: self.status_message.clone(),
+            filter_pattern: mailbox_state.filter_pattern.clone(),
         }
     }
 
@@ -172,6 +213,16 @@ impl InboxState {
 
     fn current_mailbox_mut(&mut self) -> &mut MailboxState {
         &mut self.mailbox_states[self.selected_mailbox]
+    }
+
+    fn search(&mut self, pattern: String) {
+        self.current_mailbox_mut().apply_filter(if pattern.is_empty() { None } else { Some(pattern) });
+        self.dirty.mark_message_views();
+    }
+    
+    fn clear_search(&mut self) {
+        self.current_mailbox_mut().apply_filter(None);
+        self.dirty.mark_message_views();
     }
 
     fn new(mailboxes: Vec<Mailbox>) -> Self {
@@ -189,8 +240,8 @@ impl InboxState {
 
     fn select_next_message(&mut self) {
         let mailbox = self.current_mailbox_mut();
-        if !mailbox.mailbox.messages.is_empty()
-            && mailbox.selected_message < mailbox.mailbox.messages.len() - 1
+        if !mailbox.visible_indices.is_empty()
+            && mailbox.selected_message < mailbox.visible_indices.len() - 1
         {
             mailbox.selected_message += 1;
             self.status_message = format!(
@@ -221,7 +272,7 @@ impl InboxState {
     fn update_scroll_offset(&mut self, viewport_height: usize) {
         let mailbox = self.current_mailbox_mut();
         let selected = mailbox.selected_message;
-        let total = mailbox.mailbox.messages.len();
+        let total = mailbox.visible_indices.len();
         let scroll = &mut mailbox.scroll_offset;
 
         if total == 0 || viewport_height == 0 {
@@ -405,6 +456,151 @@ fn op_sidebar_prev(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> 
     with_inbox_state(win, |state| state.select_prev_mailbox())
 }
 
+/// Global function handler for EnterCommand (:).
+fn op_enter_command(win: &mut MuttWindow, ctx: &mut GuiContext, _op: OpCode) -> FunctionRetval {
+    // We need to access the message window which is usually at the root level.
+    // Since we don't have direct access to MessageWindow here, we'll just use stdout directly
+    // and rely on mw_enter_fname to handle the UI at the cursor position.
+    
+    let mut stdout = std::io::stdout();
+    // Move to bottom left
+    let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let _ = crossterm::queue!(stdout, MoveTo(0, rows - 1));
+
+    let mut command = String::new();
+    let mut completion = FileCompletionData::default();
+
+    // Temporarily show cursor
+    let _ = crossterm::execute!(stdout, crossterm::cursor::Show);
+
+    let ret = mw_enter_fname(
+        &mut stdout,
+        ":",
+        &mut command,
+        &mut completion,
+        SelectFileFlags::NONE,
+    );
+
+    let _ = crossterm::execute!(stdout, crossterm::cursor::Hide);
+
+    if let Ok(0) = ret {
+        match parse_command(&command) {
+            CommandAction::Op(OpCode::Quit) => return FunctionRetval::Abort,
+            CommandAction::Set(key, value) => {
+                if key == "status_on_top" {
+                    // Try to find the root window from the passed window.
+                    if let Some(parent) = win.parent.as_ref().and_then(|p| p.upgrade()) {
+                        let root = MuttWindow::get_root(&parent);
+                        let is_top = value == "yes" || value == "true" || value == "1";
+                        window_status_on_top(&root, is_top);
+                        
+                        // Update status message
+                        if let Some(state) = win.wdata_mut::<InboxState>() {
+                            state.status_message = format!("Set status_on_top = {}", is_top);
+                            state.dirty.message.set(true);
+                        }
+                        return FunctionRetval::Done;
+                    }
+                }
+                 if let Some(state) = win.wdata_mut::<InboxState>() {
+                    state.status_message = format!("Unknown option: {}", key);
+                    state.dirty.message.set(true);
+                }
+            }
+            CommandAction::Op(op) => {
+                  if let Some(state) = win.wdata_mut::<InboxState>() {
+                    state.status_message = format!("Command opcode: {:?}", op);
+                    state.dirty.message.set(true);
+                }
+            }
+            CommandAction::Unknown(cmd) => {
+                 if let Some(state) = win.wdata_mut::<InboxState>() {
+                    state.status_message = format!("Unknown command: {}", cmd);
+                    state.dirty.message.set(true);
+                }
+            }
+            CommandAction::Empty => {}
+        }
+    }
+
+    FunctionRetval::Done
+}
+
+/// Global function handler for Search (/).
+fn op_search(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> FunctionRetval {
+    let mut stdout = std::io::stdout();
+    let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let _ = crossterm::queue!(stdout, MoveTo(0, rows - 1));
+
+    let mut pattern = String::new();
+    let mut completion = FileCompletionData::default();
+
+    let _ = crossterm::execute!(stdout, crossterm::cursor::Show);
+
+    let ret = mw_enter_fname(
+        &mut stdout,
+        "/",
+        &mut pattern,
+        &mut completion,
+        SelectFileFlags::NONE,
+    );
+
+    let _ = crossterm::execute!(stdout, crossterm::cursor::Hide);
+
+    if let Ok(0) = ret {
+        if let Some(state) = win.wdata_mut::<InboxState>() {
+             if pattern.is_empty() {
+                 state.clear_search();
+                 state.status_message = "Search cleared".to_string();
+             } else {
+                 state.search(pattern);
+                 state.status_message = format!("Searching for: {}", state.current_mailbox().filter_pattern.as_ref().unwrap());
+             }
+             state.dirty.message.set(true);
+        }
+    }
+
+    FunctionRetval::Done
+}
+
+/// Global function handler for Mail (m).
+fn op_mail(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> FunctionRetval {
+    let mut stdout = std::io::stdout();
+    let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let _ = crossterm::queue!(stdout, MoveTo(0, rows - 1));
+
+    let mut to_addr = String::new();
+    let mut subject = String::new();
+    let mut completion = FileCompletionData::default();
+
+    let _ = crossterm::execute!(stdout, crossterm::cursor::Show);
+
+    if let Ok(0) = mw_enter_fname(
+        &mut stdout,
+        "To:",
+        &mut to_addr,
+        &mut completion,
+        SelectFileFlags::NONE,
+    ) {
+         if let Ok(0) = mw_enter_fname(
+            &mut stdout,
+            "Subject:",
+            &mut subject,
+            &mut completion,
+            SelectFileFlags::NONE,
+        ) {
+             if let Some(state) = win.wdata_mut::<InboxState>() {
+                state.status_message = format!("Sent mail to '{}' with subject '{}'", to_addr, subject);
+                state.dirty.message.set(true);
+            }
+        }
+    }
+
+    let _ = crossterm::execute!(stdout, crossterm::cursor::Hide);
+
+    FunctionRetval::Done
+}
+
 /// Inbox-specific global functions for navigation.
 fn inbox_global_functions() -> Vec<GlobalFunctionEntry> {
     let mut funcs: Vec<GlobalFunctionEntry> = default_global_functions().to_vec();
@@ -424,6 +620,18 @@ fn inbox_global_functions() -> Vec<GlobalFunctionEntry> {
         GlobalFunctionEntry {
             op: OpCode::SidebarPrev,
             function: op_sidebar_prev,
+        },
+        GlobalFunctionEntry {
+            op: OpCode::EnterCommand,
+            function: op_enter_command,
+        },
+        GlobalFunctionEntry {
+            op: OpCode::Search,
+            function: op_search,
+        },
+        GlobalFunctionEntry {
+            op: OpCode::Mail,
+            function: op_mail,
         },
     ]);
     funcs
@@ -463,12 +671,7 @@ fn draw_sidebar(
             let is_selected = row as usize == data.selected_mailbox;
 
             if is_selected {
-                let selected = AttrColor::new(
-                    Some(Color::White),
-                    Some(Color::DarkGrey),
-                    &[Attribute::Bold],
-                );
-                mutt_curses_set_color(ctx, out, &selected)?;
+                mutt_curses_set_color_by_id(ctx, out, ColorId::Indicator)?;
             } else {
                 mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
             }
@@ -506,12 +709,7 @@ fn draw_index(
             let is_selected = msg_index == data.selected_message;
 
             if is_selected {
-                let selected = AttrColor::new(
-                    Some(Color::White),
-                    Some(Color::DarkCyan),
-                    &[Attribute::Bold],
-                );
-                mutt_curses_set_color(ctx, out, &selected)?;
+                mutt_curses_set_color_by_id(ctx, out, ColorId::Indicator)?;
             } else {
                 mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
             }
@@ -705,15 +903,21 @@ fn redraw(stdout: &mut Stdout, windows: &mut Windows) -> Result<()> {
     if windows.state().dirty.index_bar.get() {
         let mailbox_name = &render_data.mailbox_names[render_data.selected_mailbox];
         let msg_count = render_data.messages.len();
+        let filter_status = if let Some(ref pat) = render_data.filter_pattern {
+             format!(" [Limit: {}]", pat)
+        } else {
+            String::new()
+        };
         let title = if msg_count > 0 {
             format!(
-                " {} [{}/{}] ",
+                " {} [{}/{}] {} ",
                 mailbox_name,
                 render_data.selected_message + 1,
-                msg_count
+                msg_count,
+                filter_status
             )
         } else {
-            format!(" {} [empty] ", mailbox_name)
+            format!(" {} [empty]{} ", mailbox_name, filter_status)
         };
         let win = windows.layout.index_bar.borrow();
         draw_status_bar(&mut windows.ctx, stdout, &win, &title)?;

@@ -83,7 +83,7 @@ const fn key_special(code: KeyCode) -> Key {
 
 /// Default generic bindings (available everywhere).
 pub fn generic_default_bindings() -> &'static [KeyBinding] {
-    static BINDINGS: [KeyBinding; 45] = [
+    static BINDINGS: [KeyBinding; 46] = [
         KeyBinding {
             key: key_char('L'),
             op: OpCode::BottomPage,
@@ -171,6 +171,10 @@ pub fn generic_default_bindings() -> &'static [KeyBinding] {
         KeyBinding {
             key: key_char('M'),
             op: OpCode::MiddlePage,
+        },
+        KeyBinding {
+            key: key_char('m'),
+            op: OpCode::Mail,
         },
         KeyBinding {
             key: key_special(KeyCode::Down),

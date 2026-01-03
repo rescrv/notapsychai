@@ -375,6 +375,8 @@ fn mw_enter_fname_with<R>(
 where
     R: FnMut() -> std::io::Result<Event>,
 {
+    out.execute(Print("\r"))?;
+    out.execute(Clear(ClearType::CurrentLine))?;
     out.execute(Print(prompt))?;
     out.execute(Print(" "))?;
     out.execute(Print(fname.as_str()))?;
@@ -386,7 +388,6 @@ where
         if let Event::Key(key) = read_event()? {
             match key.code {
                 KeyCode::Enter => {
-                    out.execute(Print("\r\n"))?;
                     break;
                 }
                 KeyCode::Backspace => {
@@ -395,13 +396,9 @@ where
                     }
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    out.execute(Print("\r\n"))?;
-                    out.flush()?;
                     return Ok(-1);
                 }
                 KeyCode::Esc => {
-                    out.execute(Print("\r\n"))?;
-                    out.flush()?;
                     return Ok(-1);
                 }
                 KeyCode::Char(ch) => {
