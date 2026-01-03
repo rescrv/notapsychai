@@ -280,6 +280,9 @@ impl InboxState {
             return;
         }
 
+        // Clamp scrolloff to avoid conflicts in small viewports (centers the cursor)
+        let scrolloff = SCROLLOFF.min(viewport_height.saturating_sub(1) / 2);
+
         // Maximum scroll position (can't scroll past the end).
         let max_scroll = total.saturating_sub(viewport_height);
 
@@ -294,14 +297,18 @@ impl InboxState {
             *scroll = selected.saturating_sub(viewport_height - 1);
         }
 
-        // Apply scrolloff: ensure SCROLLOFF lines below cursor, unless we're near the end.
-        // The "ideal" bottom position for the cursor is viewport_height - 1 - SCROLLOFF
-        // rows from the top of viewport. If cursor is lower than that, scroll down.
-        let cursor_pos_in_viewport = selected.saturating_sub(*scroll);
-        let ideal_max_pos = viewport_height.saturating_sub(1 + SCROLLOFF);
+        let mut cursor_pos_in_viewport = selected.saturating_sub(*scroll);
+
+        // Top scrolloff
+        if cursor_pos_in_viewport < scrolloff {
+            *scroll = selected.saturating_sub(scrolloff);
+            cursor_pos_in_viewport = selected.saturating_sub(*scroll);
+        }
+
+        // Bottom scrolloff
+        let ideal_max_pos = viewport_height.saturating_sub(1 + scrolloff);
 
         if cursor_pos_in_viewport > ideal_max_pos {
-            // Need to scroll down, but only if doing so won't push us past max_scroll.
             let adjustment = cursor_pos_in_viewport - ideal_max_pos;
             *scroll = (*scroll + adjustment).min(max_scroll);
         }
@@ -1105,9 +1112,11 @@ mod tests {
         );
 
         // Message 2 causes scroll because we need 3 lines below cursor.
+        // However, with viewport 5, scrolloff is clamped to 2.
+        // ideal_max = 5 - 1 - 2 = 2. Pos 2 <= 2. No scroll needed.
         state.current_mailbox_mut().selected_message = 2;
         state.update_scroll_offset(5);
-        assert_eq!(state.current_mailbox().scroll_offset, 1);
+        assert_eq!(state.current_mailbox().scroll_offset, 0);
         println!(
             "selected=2, scroll_offset={}",
             state.current_mailbox().scroll_offset
@@ -1194,5 +1203,24 @@ mod tests {
 
         // Scroll should have decreased.
         assert!(scroll_at_5 < scroll_at_10);
+    }
+
+    #[test]
+    fn scrolloff_scrolls_up_when_moving_up() {
+        // With 10 messages and viewport of 5, SCROLLOFF=3.
+        // Selecting message 4 with scroll 4 (msg 4 at top).
+        // Viewport 5 => effective scrolloff = min(3, (5-1)/2) = 2.
+        // Top check: pos 0 < 2. Scroll = 4 - 2 = 2.
+        let mailbox = make_test_mailbox(10);
+        let mut state = InboxState::new(vec![mailbox]);
+
+        // Setup: scroll down so we can scroll up.
+        state.current_mailbox_mut().scroll_offset = 4;
+        state.current_mailbox_mut().selected_message = 4;
+
+        state.update_scroll_offset(5);
+
+        println!("scroll: {}", state.current_mailbox().scroll_offset);
+        assert_eq!(state.current_mailbox().scroll_offset, 2);
     }
 }
