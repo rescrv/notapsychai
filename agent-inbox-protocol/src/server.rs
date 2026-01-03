@@ -1,4 +1,4 @@
-use crate::{MailboxProvider, QueryParameters, QueryResult};
+use crate::{ActionRequest, ActionResponse, MailboxProvider, QueryParameters, QueryResult};
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -12,6 +12,7 @@ where
     let state = Arc::new(Mutex::new(provider));
     Router::new()
         .route("/query", post(query_handler::<P>))
+        .route("/action", post(action_handler::<P>))
         .with_state(state)
 }
 
@@ -26,6 +27,22 @@ where
     let mut provider = state.lock().await;
     let result = provider
         .query(params)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(result))
+}
+
+async fn action_handler<P>(
+    State(state): State<Arc<Mutex<P>>>,
+    Json(request): Json<ActionRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, impl IntoResponse)>
+where
+    P: MailboxProvider + Send + 'static,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut provider = state.lock().await;
+    let result = provider
+        .action(request)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(Json(result))

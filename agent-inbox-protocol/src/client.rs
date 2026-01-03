@@ -1,4 +1,4 @@
-use crate::{MailboxProvider, QueryParameters, QueryResult};
+use crate::{ActionRequest, ActionResponse, MailboxProvider, QueryParameters, QueryResult};
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -23,6 +23,10 @@ impl Client {
     fn query_url(&self) -> String {
         format!("{}/query", self.base_url.trim_end_matches('/'))
     }
+
+    fn action_url(&self) -> String {
+        format!("{}/action", self.base_url.trim_end_matches('/'))
+    }
 }
 
 #[async_trait::async_trait]
@@ -38,5 +42,16 @@ impl MailboxProvider for Client {
             .await?
             .error_for_status()?;
         response.json::<QueryResult>().await
+    }
+
+    async fn action(&mut self, request: ActionRequest) -> Result<ActionResponse, Self::Error> {
+        let response = self
+            .http
+            .post(self.action_url())
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+        response.json::<ActionResponse>().await
     }
 }
