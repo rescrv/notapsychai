@@ -75,6 +75,7 @@ pub use inbox::run;
 pub use inbox::run_from_servers;
 pub use inbox::run_with_mailboxes;
 pub use inbox::sample_mailbox_data;
+pub use inbox::ServerConfig;
 
 // Re-export agent-inbox-protocol types for convenience.
 pub use agent_inbox_protocol::router;

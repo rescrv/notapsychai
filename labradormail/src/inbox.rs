@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use agent_inbox_protocol::Client;
 use agent_inbox_protocol::Mailbox;
+use agent_inbox_protocol::MailboxName;
 use agent_inbox_protocol::MailboxProvider;
 use agent_inbox_protocol::Message;
 use agent_inbox_protocol::QueryParameters;
@@ -66,6 +67,29 @@ use crate::HelpItem;
 use crate::IndexPagerLayout;
 use crate::RootWindow;
 use crate::SelectFileFlags;
+
+/// Configuration for a single mail server.
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    /// The service name (used as prefix when not merging).
+    pub name: String,
+    /// The base URL for the agent-inbox-protocol server.
+    pub base_url: String,
+    /// If true, mailboxes appear at top level and merge with same-named mailboxes from other
+    /// sources. If false, mailboxes are prefixed with the service name (e.g., "Work/INBOX").
+    pub merge: bool,
+}
+
+impl ServerConfig {
+    /// Creates a new server configuration.
+    pub fn new(name: impl Into<String>, base_url: impl Into<String>, merge: bool) -> Self {
+        Self {
+            name: name.into(),
+            base_url: base_url.into(),
+            merge,
+        }
+    }
+}
 
 /// Dirty flags for selective redrawing.
 #[derive(Default)]
@@ -1097,32 +1121,64 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Spawn a background thread to fetch mailboxes from multiple servers.
 fn spawn_background_fetch(
-    base_urls: Vec<String>,
+    configs: Vec<ServerConfig>,
 ) -> Receiver<std::result::Result<Vec<Mailbox>, String>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = fetch_mailboxes_from_urls(&base_urls);
+        let result = fetch_and_merge_mailboxes(&configs);
         let _ = tx.send(result);
     });
     rx
 }
 
-/// Fetch mailboxes from multiple URLs and concatenate results.
-fn fetch_mailboxes_from_urls(base_urls: &[String]) -> std::result::Result<Vec<Mailbox>, String> {
-    let mut all_mailboxes = Vec::new();
+/// Fetch mailboxes from multiple servers and merge/prefix based on config.
+///
+/// For servers with `merge=true`, mailboxes retain their original names and are merged
+/// with same-named mailboxes from other merge sources. For servers with `merge=false`,
+/// mailbox names are prefixed with the service name (e.g., "Work/INBOX").
+fn fetch_and_merge_mailboxes(
+    configs: &[ServerConfig],
+) -> std::result::Result<Vec<Mailbox>, String> {
+    use std::collections::HashMap;
+
+    let mut merged: HashMap<String, Mailbox> = HashMap::new();
     let mut errors = Vec::new();
 
-    for base_url in base_urls {
-        match fetch_mailboxes_blocking(base_url, QueryParameters::default()) {
-            Ok(mailboxes) => all_mailboxes.extend(mailboxes),
-            Err(e) => errors.push(format!("{}: {}", base_url, e)),
+    for config in configs {
+        match fetch_mailboxes_blocking(&config.base_url, QueryParameters::default()) {
+            Ok(mailboxes) => {
+                for mailbox in mailboxes {
+                    let name = if config.merge {
+                        mailbox.name.as_str().to_string()
+                    } else {
+                        format!("{}/{}", config.name, mailbox.name.as_str())
+                    };
+
+                    if let Some(existing) = merged.get_mut(&name) {
+                        // Merge messages into existing mailbox.
+                        existing.messages.extend(mailbox.messages);
+                    } else {
+                        // Create new mailbox with the (possibly prefixed) name.
+                        let new_name = MailboxName::new(&name).unwrap_or(mailbox.name.clone());
+                        let new_mailbox = Mailbox {
+                            name: new_name,
+                            messages: mailbox.messages,
+                        };
+                        merged.insert(name, new_mailbox);
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{}: {}", config.base_url, e)),
         }
     }
 
-    if all_mailboxes.is_empty() && !errors.is_empty() {
+    if merged.is_empty() && !errors.is_empty() {
         Err(errors.join("; "))
     } else {
-        Ok(all_mailboxes)
+        // Sort mailboxes by name for consistent ordering.
+        let mut mailboxes: Vec<Mailbox> = merged.into_values().collect();
+        mailboxes.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        Ok(mailboxes)
     }
 }
 
@@ -1130,7 +1186,7 @@ fn fetch_mailboxes_from_urls(base_urls: &[String]) -> std::result::Result<Vec<Ma
 fn run_loop_with_refresh(
     stdout: &mut Stdout,
     mailboxes: Vec<Mailbox>,
-    base_urls: &[String],
+    configs: &[ServerConfig],
 ) -> Result<()> {
     let mut windows = Windows::new(stdout, mailboxes)?;
 
@@ -1180,7 +1236,7 @@ fn run_loop_with_refresh(
 
         // Start a new background fetch if it's time and none is pending.
         if pending_fetch.is_none() && last_refresh.elapsed() >= REFRESH_INTERVAL {
-            pending_fetch = Some(spawn_background_fetch(base_urls.to_vec()));
+            pending_fetch = Some(spawn_background_fetch(configs.to_vec()));
             last_refresh = std::time::Instant::now();
         }
 
@@ -1257,9 +1313,11 @@ pub fn run_with_mailboxes(mailboxes: Vec<Mailbox>) -> Result<()> {
 /// Run the inbox application by fetching from multiple agent-inbox-protocol servers.
 ///
 /// Fetches mailboxes initially from all servers, then periodically refreshes in the
-/// background without blocking the event loop.
-pub fn run_from_servers(base_urls: &[String]) -> Result<()> {
-    let mailboxes = fetch_mailboxes_from_urls(base_urls).map_err(std::io::Error::other)?;
+/// background without blocking the event loop. Mailboxes from servers with `merge=true`
+/// are combined at the top level, while servers with `merge=false` have their mailboxes
+/// prefixed with the service name.
+pub fn run_from_servers(configs: &[ServerConfig]) -> Result<()> {
+    let mailboxes = fetch_and_merge_mailboxes(configs).map_err(std::io::Error::other)?;
 
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -1269,7 +1327,7 @@ pub fn run_from_servers(base_urls: &[String]) -> Result<()> {
     }));
 
     let mut stdout = stdout();
-    let result = run_loop_with_refresh(&mut stdout, mailboxes, base_urls);
+    let result = run_loop_with_refresh(&mut stdout, mailboxes, configs);
     let _ = RootWindow::cleanup(&mut stdout);
     result?;
 
