@@ -145,6 +145,58 @@ impl Verb {
 
 /////////////////////////////////////////////// Action //////////////////////////////////////////////
 
+/// Allowed shortcut keys for actions.
+///
+/// These keys are chosen to avoid conflicts with standard navigation bindings (j/k/J/K for
+/// movement, q for quit, ? for help, / for search, etc.) while providing intuitive shortcuts
+/// for common actions.
+pub const ALLOWED_SHORTCUTS: &[char] = &[
+    'a', // archive
+    'b', // back/bounce
+    'c', // compose/create
+    'd', // done/delete
+    'e', // edit
+    'f', // forward/flag
+    'g', // go
+    'h', // (reserved for help in some contexts, but allowed here)
+    'i', // inbox/important
+    'l', // label
+    'o', // open
+    'p', // print/pin
+    'r', // reply
+    's', // star/spam/snooze
+    'u', // unread/undo
+    'v', // view
+    'w', // write
+    'x', // delete/archive (common in some UIs)
+    'y', // yes/confirm
+    'A', // Archive (shifted variant)
+    'B', // Bounce (shifted variant)
+    'C', // Compose (shifted variant)
+    'D', // Defer/Delete (shifted variant)
+    'E', // Edit (shifted variant)
+    'F', // Forward (shifted variant)
+    'G', // Go (shifted variant)
+    'I', // Important (shifted variant)
+    'O', // Open (shifted variant)
+    'P', // Print (shifted variant)
+    'R', // Reply-all (shifted variant)
+    'S', // Send (shifted variant)
+    'U', // Unsubscribe (shifted variant)
+    'W', // Write (shifted variant)
+    'X', // Delete (shifted variant)
+    'Y', // Yes (shifted variant)
+];
+
+/// Returns true if the given shortcut is in the allow-list.
+pub fn is_allowed_shortcut(shortcut: &str) -> bool {
+    if shortcut.len() != 1 {
+        return false;
+    }
+    let ch = shortcut.chars().next().unwrap();
+    ALLOWED_SHORTCUTS.contains(&ch)
+}
+
 /// An action that can be performed on a message.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Action {
@@ -168,8 +220,25 @@ impl Action {
     }
 
     /// Creates a new action with a shortcut.
+    ///
+    /// The shortcut is validated against the allow-list; invalid shortcuts are ignored.
     pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self {
-        self.shortcut = Some(shortcut.into());
+        let s = shortcut.into();
+        if is_allowed_shortcut(&s) {
+            self.shortcut = Some(s);
+        }
+        self
+    }
+
+    /// Returns a copy of this action with the shortcut sanitized.
+    ///
+    /// If the shortcut is not in the allow-list, it is removed.
+    pub fn sanitized(mut self) -> Self {
+        if let Some(ref s) = self.shortcut
+            && !is_allowed_shortcut(s)
+        {
+            self.shortcut = None;
+        }
         self
     }
 }
@@ -251,6 +320,27 @@ impl QueryResult {
     pub fn into_mailboxes(self) -> Vec<Mailbox> {
         self.mailboxes
     }
+
+    /// Returns a sanitized copy of this query result.
+    ///
+    /// Removes any action shortcuts that are not in the allow-list.
+    pub fn sanitized(self) -> Self {
+        let mailboxes = self
+            .mailboxes
+            .into_iter()
+            .map(|mut mailbox| {
+                for message in &mut mailbox.messages {
+                    message.actions = message
+                        .actions
+                        .drain(..)
+                        .map(|action| action.sanitized())
+                        .collect();
+                }
+                mailbox
+            })
+            .collect();
+        Self { mailboxes }
+    }
 }
 
 ////////////////////////////////////////// MailboxProvider /////////////////////////////////////////
@@ -308,5 +398,123 @@ impl ActionResponse {
             success: false,
             message: Some(message.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_allowed_shortcut_accepts_valid_lowercase() {
+        assert!(is_allowed_shortcut("a"));
+        assert!(is_allowed_shortcut("d"));
+        assert!(is_allowed_shortcut("r"));
+        assert!(is_allowed_shortcut("x"));
+    }
+
+    #[test]
+    fn is_allowed_shortcut_accepts_valid_uppercase() {
+        assert!(is_allowed_shortcut("A"));
+        assert!(is_allowed_shortcut("D"));
+        assert!(is_allowed_shortcut("R"));
+        assert!(is_allowed_shortcut("S"));
+    }
+
+    #[test]
+    fn is_allowed_shortcut_rejects_reserved_keys() {
+        // Navigation keys.
+        assert!(!is_allowed_shortcut("j"));
+        assert!(!is_allowed_shortcut("k"));
+        assert!(!is_allowed_shortcut("J"));
+        assert!(!is_allowed_shortcut("K"));
+        assert!(!is_allowed_shortcut("q"));
+        assert!(!is_allowed_shortcut("n"));
+        assert!(!is_allowed_shortcut("m"));
+        assert!(!is_allowed_shortcut("t"));
+        assert!(!is_allowed_shortcut("z"));
+        assert!(!is_allowed_shortcut("Z"));
+        assert!(!is_allowed_shortcut("H"));
+        assert!(!is_allowed_shortcut("L"));
+        assert!(!is_allowed_shortcut("M"));
+        assert!(!is_allowed_shortcut("V"));
+    }
+
+    #[test]
+    fn is_allowed_shortcut_rejects_special_characters() {
+        assert!(!is_allowed_shortcut("?"));
+        assert!(!is_allowed_shortcut("/"));
+        assert!(!is_allowed_shortcut(":"));
+        assert!(!is_allowed_shortcut(";"));
+        assert!(!is_allowed_shortcut("!"));
+        assert!(!is_allowed_shortcut("1"));
+        assert!(!is_allowed_shortcut("*"));
+    }
+
+    #[test]
+    fn is_allowed_shortcut_rejects_multi_char_strings() {
+        assert!(!is_allowed_shortcut("ab"));
+        assert!(!is_allowed_shortcut("dd"));
+        assert!(!is_allowed_shortcut(""));
+    }
+
+    #[test]
+    fn action_with_shortcut_accepts_valid() {
+        let action = Action::new(Verb::new("done").unwrap(), "Done").with_shortcut("d");
+        assert_eq!(action.shortcut, Some("d".to_string()));
+    }
+
+    #[test]
+    fn action_with_shortcut_rejects_invalid() {
+        let action = Action::new(Verb::new("quit").unwrap(), "Quit").with_shortcut("q");
+        assert_eq!(action.shortcut, None);
+    }
+
+    #[test]
+    fn action_sanitized_removes_invalid_shortcut() {
+        let mut action = Action::new(Verb::new("test").unwrap(), "Test");
+        action.shortcut = Some("q".to_string()); // Manually set invalid shortcut.
+        let sanitized = action.sanitized();
+        assert_eq!(sanitized.shortcut, None);
+    }
+
+    #[test]
+    fn action_sanitized_preserves_valid_shortcut() {
+        let mut action = Action::new(Verb::new("done").unwrap(), "Done");
+        action.shortcut = Some("d".to_string());
+        let sanitized = action.sanitized();
+        assert_eq!(sanitized.shortcut, Some("d".to_string()));
+    }
+
+    #[test]
+    fn query_result_sanitized_scrubs_all_actions() {
+        let mut action1 = Action::new(Verb::new("done").unwrap(), "Done");
+        action1.shortcut = Some("d".to_string()); // Valid.
+        let mut action2 = Action::new(Verb::new("quit").unwrap(), "Quit");
+        action2.shortcut = Some("q".to_string()); // Invalid.
+        let mut action3 = Action::new(Verb::new("nav").unwrap(), "Navigate");
+        action3.shortcut = Some("j".to_string()); // Invalid.
+
+        let message = Message {
+            msg_id: MessageId::new("msg-1").unwrap(),
+            date: Utc::now(),
+            from: From::new("test@example.com").unwrap(),
+            body: Body::new("Test").unwrap(),
+            wrap: false,
+            actions: vec![action1, action2, action3],
+        };
+
+        let mailbox = Mailbox {
+            name: MailboxName::new("INBOX").unwrap(),
+            messages: vec![message],
+        };
+
+        let result = QueryResult::new(vec![mailbox]).sanitized();
+        let actions = &result.mailboxes()[0].messages[0].actions;
+
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].shortcut, Some("d".to_string()));
+        assert_eq!(actions[1].shortcut, None);
+        assert_eq!(actions[2].shortcut, None);
     }
 }

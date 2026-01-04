@@ -2,7 +2,10 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use agent_inbox_protocol::{Body, Mailbox, MailboxName, Message, QueryParameters, QueryResult};
+use agent_inbox_protocol::{
+    Action, ActionRequest, ActionResponse, Body, Mailbox, MailboxName, Message, MessageId,
+    QueryParameters, QueryResult, Verb,
+};
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -10,7 +13,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
@@ -94,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/spoons", get(get_spoons).put(set_spoons))
         .route("/user", get(get_user).put(update_user))
         .route("/inbox/query", post(inbox_query))
+        .route("/inbox/action", post(inbox_action))
         .layer(cors)
         .with_state(state);
 
@@ -551,11 +555,26 @@ async fn inbox_query(
 
     let mut messages: Vec<Message> = schedule
         .into_iter()
-        .map(|(datetime, rhythm_def)| Message {
-            date: datetime.with_timezone(&Utc),
-            from: from_addr.clone(),
-            body: Body::new(&rhythm_def.description).unwrap_or_default(),
-            wrap: true,
+        .map(|(datetime, rhythm_def)| {
+            let msg_id = MessageId::new(format!(
+                "{}:{}",
+                rhythm_def.id.to_string(),
+                datetime.timestamp()
+            ))
+            .unwrap_or_default();
+            Message {
+                msg_id,
+                date: datetime.with_timezone(&Utc),
+                from: from_addr.clone(),
+                body: Body::new(&rhythm_def.description).unwrap_or_default(),
+                wrap: true,
+                actions: vec![
+                    Action::new(Verb::new("done").unwrap_or_default(), "Mark Done")
+                        .with_shortcut("d"),
+                    Action::new(Verb::new("defer").unwrap_or_default(), "Defer")
+                        .with_shortcut("D"),
+                ],
+            }
         })
         .collect();
 
@@ -608,4 +627,87 @@ async fn inbox_query(
     }
 
     Ok(Json(QueryResult::new(mailboxes)))
+}
+
+async fn inbox_action(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ActionRequest>,
+) -> Result<Json<ActionResponse>, AppError> {
+    let user_id = extract_user_from_headers(&headers, &state).await?;
+
+    let msg_id = request.message_id.as_str();
+    let mut parts = msg_id.split(':');
+    let rhythm_part = match parts.next() {
+        Some(part) => part,
+        None => {
+            return Ok(Json(ActionResponse::failure(
+                "Invalid message ID format",
+            )));
+        }
+    };
+    let timestamp_part = match parts.next() {
+        Some(part) => part,
+        None => {
+            return Ok(Json(ActionResponse::failure(
+                "Invalid message ID format",
+            )));
+        }
+    };
+    if parts.next().is_some() {
+        return Ok(Json(ActionResponse::failure(
+            "Invalid message ID format",
+        )));
+    }
+
+    let Some(rhythm_id) = RhythmID::from_human_readable(rhythm_part) else {
+        return Ok(Json(ActionResponse::failure(
+            "Invalid rhythm ID in message",
+        )));
+    };
+
+    let timestamp = match timestamp_part.parse::<i64>() {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(Json(ActionResponse::failure(
+                "Invalid timestamp in message",
+            )));
+        }
+    };
+    let Some(when) = Utc.timestamp_opt(timestamp, 0).single() else {
+        return Ok(Json(ActionResponse::failure(
+            "Invalid timestamp in message",
+        )));
+    };
+
+    let verb = request.verb.as_str();
+
+    match verb {
+        "done" => {
+            let mut manager = db::load_rhythm_manager(&state.pool, user_id).await?;
+            manager.mark_done_at(rhythm_id, when)?;
+            for event in manager.events() {
+                if event.rhythm_id == rhythm_id && event.when == when {
+                    db::save_event(&state.pool, user_id, event).await?;
+                    break;
+                }
+            }
+            Ok(Json(ActionResponse::success_with_message("Marked as done")))
+        }
+        "defer" => {
+            let mut manager = db::load_rhythm_manager(&state.pool, user_id).await?;
+            manager.defer_rhythm_at(rhythm_id, when)?;
+            for event in manager.events() {
+                if event.rhythm_id == rhythm_id && event.when == when {
+                    db::save_event(&state.pool, user_id, event).await?;
+                    break;
+                }
+            }
+            Ok(Json(ActionResponse::success_with_message("Deferred")))
+        }
+        _ => Ok(Json(ActionResponse::failure(format!(
+            "Unknown verb: {}",
+            verb
+        )))),
+    }
 }

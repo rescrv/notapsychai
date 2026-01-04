@@ -41,7 +41,9 @@ impl MailboxProvider for Client {
             .send()
             .await?
             .error_for_status()?;
-        response.json::<QueryResult>().await
+        let result = response.json::<QueryResult>().await?;
+        // Sanitize action shortcuts to only allow-listed keys.
+        Ok(result.sanitized())
     }
 
     async fn action(&mut self, request: ActionRequest) -> Result<ActionResponse, Self::Error> {

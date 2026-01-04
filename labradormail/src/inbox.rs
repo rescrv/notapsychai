@@ -759,9 +759,13 @@ fn execute_action_blocking(
             .map_err(|e| format!("action request failed: {}", e))?;
 
         if response.success {
-            Ok(response.message.unwrap_or_else(|| "Action completed".to_string()))
+            Ok(response
+                .message
+                .unwrap_or_else(|| "Action completed".to_string()))
         } else {
-            Err(response.message.unwrap_or_else(|| "Action failed".to_string()))
+            Err(response
+                .message
+                .unwrap_or_else(|| "Action failed".to_string()))
         }
     })
 }

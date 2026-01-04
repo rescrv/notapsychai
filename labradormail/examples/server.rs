@@ -46,16 +46,16 @@ impl SampleMailboxProvider {
 
 /// Creates sample mailboxes with actions attached to messages.
 fn create_sample_mailboxes_with_actions() -> Vec<Mailbox> {
-    let done_action = Action::new(Verb::new("done").expect("valid verb"), "Mark Done")
-        .with_shortcut("d");
-    let archive_action = Action::new(Verb::new("archive").expect("valid verb"), "Archive")
-        .with_shortcut("a");
-    let defer_action = Action::new(Verb::new("defer").expect("valid verb"), "Defer")
-        .with_shortcut("D");
-    let reply_action = Action::new(Verb::new("reply").expect("valid verb"), "Reply")
-        .with_shortcut("r");
-    let delete_action = Action::new(Verb::new("delete").expect("valid verb"), "Delete")
-        .with_shortcut("x");
+    let done_action =
+        Action::new(Verb::new("done").expect("valid verb"), "Mark Done").with_shortcut("d");
+    let archive_action =
+        Action::new(Verb::new("archive").expect("valid verb"), "Archive").with_shortcut("a");
+    let defer_action =
+        Action::new(Verb::new("defer").expect("valid verb"), "Defer").with_shortcut("D");
+    let reply_action =
+        Action::new(Verb::new("reply").expect("valid verb"), "Reply").with_shortcut("r");
+    let delete_action =
+        Action::new(Verb::new("delete").expect("valid verb"), "Delete").with_shortcut("x");
 
     let inbox = Mailbox {
         name: MailboxName::new("INBOX").expect("valid mailbox name"),
@@ -64,23 +64,34 @@ fn create_sample_mailboxes_with_actions() -> Vec<Mailbox> {
                 msg_id: MessageId::new("msg-001").expect("valid message id"),
                 date: Utc::now(),
                 from: From::new("alice@example.com").expect("valid from"),
-                body: Body::new("Hello World - This is a test message with actions").expect("valid body"),
+                body: Body::new("Hello World - This is a test message with actions")
+                    .expect("valid body"),
                 wrap: false,
-                actions: vec![done_action.clone(), archive_action.clone(), reply_action.clone()],
+                actions: vec![
+                    done_action.clone(),
+                    archive_action.clone(),
+                    reply_action.clone(),
+                ],
             },
             Message {
                 msg_id: MessageId::new("msg-002").expect("valid message id"),
                 date: Utc::now(),
                 from: From::new("bob@example.com").expect("valid from"),
-                body: Body::new("Re: Hello World - Another message with different actions").expect("valid body"),
+                body: Body::new("Re: Hello World - Another message with different actions")
+                    .expect("valid body"),
                 wrap: false,
-                actions: vec![done_action.clone(), defer_action.clone(), delete_action.clone()],
+                actions: vec![
+                    done_action.clone(),
+                    defer_action.clone(),
+                    delete_action.clone(),
+                ],
             },
             Message {
                 msg_id: MessageId::new("msg-003").expect("valid message id"),
                 date: Utc::now(),
                 from: From::new("charlie@example.com").expect("valid from"),
-                body: Body::new("Project Update - Important project information").expect("valid body"),
+                body: Body::new("Project Update - Important project information")
+                    .expect("valid body"),
                 wrap: false,
                 actions: vec![archive_action.clone(), reply_action.clone()],
             },
@@ -89,16 +100,14 @@ fn create_sample_mailboxes_with_actions() -> Vec<Mailbox> {
 
     let sent = Mailbox {
         name: MailboxName::new("Sent").expect("valid mailbox name"),
-        messages: vec![
-            Message {
-                msg_id: MessageId::new("msg-004").expect("valid message id"),
-                date: Utc::now(),
-                from: From::new("me@example.com").expect("valid from"),
-                body: Body::new("Re: Hello World").expect("valid body"),
-                wrap: false,
-                actions: vec![archive_action.clone()],
-            },
-        ],
+        messages: vec![Message {
+            msg_id: MessageId::new("msg-004").expect("valid message id"),
+            date: Utc::now(),
+            from: From::new("me@example.com").expect("valid from"),
+            body: Body::new("Re: Hello World").expect("valid body"),
+            wrap: false,
+            actions: vec![archive_action.clone()],
+        }],
     };
 
     let drafts = Mailbox {
