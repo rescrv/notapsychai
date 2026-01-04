@@ -15,14 +15,13 @@
 
 use std::convert::Infallible;
 
-use agent_inbox_protocol::Action;
 use agent_inbox_protocol::Body;
 use agent_inbox_protocol::From;
 use agent_inbox_protocol::MailboxName;
 use agent_inbox_protocol::Message;
 use agent_inbox_protocol::MessageId;
-use agent_inbox_protocol::Verb;
 use chrono::Utc;
+use claudius::ToolParam;
 use labradormail::router;
 use labradormail::ActionRequest;
 use labradormail::ActionResponse;
@@ -46,16 +45,17 @@ impl SampleMailboxProvider {
 
 /// Creates sample mailboxes with actions attached to messages.
 fn create_sample_mailboxes_with_actions() -> Vec<Mailbox> {
-    let done_action =
-        Action::new(Verb::new("done").expect("valid verb"), "Mark Done").with_shortcut("d");
-    let archive_action =
-        Action::new(Verb::new("archive").expect("valid verb"), "Archive").with_shortcut("a");
-    let defer_action =
-        Action::new(Verb::new("defer").expect("valid verb"), "Defer").with_shortcut("D");
-    let reply_action =
-        Action::new(Verb::new("reply").expect("valid verb"), "Reply").with_shortcut("r");
-    let delete_action =
-        Action::new(Verb::new("delete").expect("valid verb"), "Delete").with_shortcut("x");
+    let empty_schema = serde_json::json!({"type": "object", "properties": {}});
+    let done_action = ToolParam::new("done".to_string(), empty_schema.clone())
+        .with_description("Mark the message as done and remove it from the inbox.".to_string());
+    let archive_action = ToolParam::new("archive".to_string(), empty_schema.clone())
+        .with_description("Archive the message for later reference.".to_string());
+    let defer_action = ToolParam::new("defer".to_string(), empty_schema.clone())
+        .with_description("Defer the message to be handled at a later time.".to_string());
+    let reply_action = ToolParam::new("reply".to_string(), empty_schema.clone())
+        .with_description("Reply to the message sender.".to_string());
+    let delete_action = ToolParam::new("delete".to_string(), empty_schema)
+        .with_description("Permanently delete the message.".to_string());
 
     let inbox = Mailbox {
         name: MailboxName::new("INBOX").expect("valid mailbox name"),
@@ -149,7 +149,7 @@ impl MailboxProvider for SampleMailboxProvider {
         eprintln!("Action request: {:?}", request);
         Ok(ActionResponse::success_with_message(format!(
             "Performed '{}' on message '{}'",
-            request.verb.as_str(),
+            request.name,
             request.message_id.as_str()
         )))
     }

@@ -26,7 +26,6 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
 
-use agent_inbox_protocol::ActionRequest;
 use agent_inbox_protocol::Client;
 use agent_inbox_protocol::Mailbox;
 use agent_inbox_protocol::MailboxName;
@@ -34,7 +33,6 @@ use agent_inbox_protocol::MailboxProvider;
 use agent_inbox_protocol::Message;
 use agent_inbox_protocol::MessageId;
 use agent_inbox_protocol::QueryParameters;
-use agent_inbox_protocol::Verb;
 use chrono::Utc;
 use crossterm::cursor::MoveTo;
 use crossterm::event::poll;
@@ -150,8 +148,6 @@ const SCROLLOFF: usize = 3;
 #[derive(Clone)]
 struct MailboxState {
     mailbox: Mailbox,
-    /// Source base URLs for each message (parallel to mailbox.messages).
-    message_sources: Vec<String>,
     selected_message: usize,
     scroll_offset: usize,
     visible_indices: Vec<usize>,
@@ -162,19 +158,6 @@ impl MailboxState {
     fn new(mailbox: Mailbox) -> Self {
         let count = mailbox.messages.len();
         Self {
-            message_sources: vec![String::new(); count],
-            mailbox,
-            selected_message: 0,
-            scroll_offset: 0,
-            visible_indices: (0..count).collect(),
-            filter_pattern: None,
-        }
-    }
-
-    fn new_with_sources(mailbox: Mailbox, sources: Vec<String>) -> Self {
-        let count = mailbox.messages.len();
-        Self {
-            message_sources: sources,
             mailbox,
             selected_message: 0,
             scroll_offset: 0,
@@ -296,18 +279,6 @@ impl InboxState {
                     .to_string(),
             dirty: DirtyFlags::new(),
         }
-    }
-
-    /// Returns the currently selected message and its source base URL.
-    fn current_message_with_source(&self) -> Option<(&Message, &str)> {
-        let mailbox = self.current_mailbox();
-        if mailbox.visible_indices.is_empty() {
-            return None;
-        }
-        let actual_idx = mailbox.visible_indices[mailbox.selected_message];
-        let message = &mailbox.mailbox.messages[actual_idx];
-        let source = &mailbox.message_sources[actual_idx];
-        Some((message, source))
     }
 
     fn select_next_message(&mut self) {
@@ -740,90 +711,6 @@ fn op_mail(win: &mut MuttWindow, _ctx: &mut GuiContext, _op: OpCode) -> Function
     FunctionRetval::Done
 }
 
-/// Executes an action request against a server.
-fn execute_action_blocking(
-    base_url: &str,
-    message_id: MessageId,
-    verb: Verb,
-) -> std::result::Result<String, String> {
-    let mut client = Client::new(base_url);
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
-
-    let request = ActionRequest { message_id, verb };
-
-    runtime.block_on(async {
-        let response = client
-            .action(request)
-            .await
-            .map_err(|e| format!("action request failed: {}", e))?;
-
-        if response.success {
-            Ok(response
-                .message
-                .unwrap_or_else(|| "Action completed".to_string()))
-        } else {
-            Err(response
-                .message
-                .unwrap_or_else(|| "Action failed".to_string()))
-        }
-    })
-}
-
-/// Handles action shortcut key presses.
-///
-/// Returns true if the key matched an action shortcut and was handled.
-fn handle_action_shortcut(windows: &mut Windows, key: crossterm::event::KeyEvent) -> bool {
-    use crossterm::event::KeyCode;
-
-    // Only handle single character keys for shortcuts.
-    let shortcut_char = match key.code {
-        KeyCode::Char(c) => c.to_string(),
-        _ => return false,
-    };
-
-    // Get current message and its source.
-    let state = windows.state();
-    let Some((message, source_url)) = state.current_message_with_source() else {
-        return false;
-    };
-
-    // Skip if no source URL (e.g., sample data without server).
-    if source_url.is_empty() {
-        return false;
-    }
-
-    // Find matching action by shortcut.
-    let matching_action = message
-        .actions
-        .iter()
-        .find(|action| action.shortcut.as_deref() == Some(&shortcut_char));
-
-    let Some(action) = matching_action else {
-        return false;
-    };
-
-    // Clone what we need before dropping the borrow.
-    let verb = action.verb.clone();
-    let label = action.label.clone();
-    let message_id = message.msg_id.clone();
-    let base_url = source_url.to_string();
-    drop(state);
-
-    // Execute the action.
-    match execute_action_blocking(&base_url, message_id, verb) {
-        Ok(msg) => {
-            windows.state_mut().status_message = format!("{}: {}", label, msg);
-        }
-        Err(e) => {
-            windows.state_mut().status_message = format!("{} failed: {}", label, e);
-        }
-    }
-    windows.state().dirty.message.set(true);
-
-    true
-}
-
 /// Inbox-specific global functions for navigation.
 fn inbox_global_functions() -> Vec<GlobalFunctionEntry> {
     let mut funcs: Vec<GlobalFunctionEntry> = default_global_functions().to_vec();
@@ -974,6 +861,7 @@ fn draw_pager(
     let message = &data.messages[data.selected_message];
 
     // Build actions line if there are actions.
+    // Shortcut is the first character of the action name.
     let actions_line = if message.actions.is_empty() {
         String::new()
     } else {
@@ -981,11 +869,8 @@ fn draw_pager(
             .actions
             .iter()
             .map(|a| {
-                if let Some(ref shortcut) = a.shortcut {
-                    format!("[{}] {}", shortcut, a.label)
-                } else {
-                    a.label.clone()
-                }
+                let shortcut = a.name.chars().next().unwrap_or('?');
+                format!("[{}] {}", shortcut, a.name)
             })
             .collect();
         format!("Actions: {}", action_strs.join("  "))
@@ -1336,15 +1221,12 @@ fn spawn_background_fetch(
 /// For servers with `merge=true`, mailboxes retain their original names and are merged
 /// with same-named mailboxes from other merge sources. For servers with `merge=false`,
 /// mailbox names are prefixed with the service name (e.g., "Work/INBOX").
-///
-/// Returns `MailboxState` instances that track the source base URL for each message.
 fn fetch_and_merge_mailboxes(
     configs: &[ServerConfig],
 ) -> std::result::Result<Vec<MailboxState>, String> {
     use std::collections::HashMap;
 
-    // Track mailbox data and sources together.
-    let mut merged: HashMap<String, (Mailbox, Vec<String>)> = HashMap::new();
+    let mut merged: HashMap<String, Mailbox> = HashMap::new();
     let mut errors = Vec::new();
 
     for config in configs {
@@ -1357,13 +1239,9 @@ fn fetch_and_merge_mailboxes(
                         format!("{}/{}", config.name, mailbox.name.as_str())
                     };
 
-                    let message_count = mailbox.messages.len();
-                    let sources = vec![config.base_url.clone(); message_count];
-
-                    if let Some((existing_mailbox, existing_sources)) = merged.get_mut(&name) {
-                        // Merge messages and sources into existing mailbox.
+                    if let Some(existing_mailbox) = merged.get_mut(&name) {
+                        // Merge messages into existing mailbox.
                         existing_mailbox.messages.extend(mailbox.messages);
-                        existing_sources.extend(sources);
                     } else {
                         // Create new mailbox with the (possibly prefixed) name.
                         let new_name = MailboxName::new(&name).unwrap_or(mailbox.name.clone());
@@ -1371,7 +1249,7 @@ fn fetch_and_merge_mailboxes(
                             name: new_name,
                             messages: mailbox.messages,
                         };
-                        merged.insert(name, (new_mailbox, sources));
+                        merged.insert(name, new_mailbox);
                     }
                 }
             }
@@ -1383,12 +1261,12 @@ fn fetch_and_merge_mailboxes(
         Err(errors.join("; "))
     } else {
         // Sort mailboxes by name for consistent ordering.
-        let mut items: Vec<(String, (Mailbox, Vec<String>))> = merged.into_iter().collect();
+        let mut items: Vec<(String, Mailbox)> = merged.into_iter().collect();
         items.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mailbox_states = items
             .into_iter()
-            .map(|(_, (mailbox, sources))| MailboxState::new_with_sources(mailbox, sources))
+            .map(|(_, mailbox)| MailboxState::new(mailbox))
             .collect();
 
         Ok(mailbox_states)
@@ -1457,25 +1335,20 @@ fn run_loop_with_refresh(
         if poll(POLL_TIMEOUT)? {
             match read()? {
                 Event::Key(key) => {
-                    // First check for action shortcuts on the current message.
-                    if handle_action_shortcut(&mut windows, key) {
-                        // Action was handled.
-                    } else {
-                        let op = lookup_binding(dialog_default_bindings(), key)
-                            .or_else(|| lookup_binding(generic_default_bindings(), key));
-                        if let Some(op) = op {
-                            let ret = global_function_dispatcher_active(
-                                &windows.layout.dialog,
-                                &mut windows.ctx,
-                                op,
-                                &windows.global_functions,
-                            );
-                            if ret == FunctionRetval::Abort {
-                                break;
-                            }
-                            if ret != FunctionRetval::Unhandled {
-                                windows.state().dirty.help_bar.set(true);
-                            }
+                    let op = lookup_binding(dialog_default_bindings(), key)
+                        .or_else(|| lookup_binding(generic_default_bindings(), key));
+                    if let Some(op) = op {
+                        let ret = global_function_dispatcher_active(
+                            &windows.layout.dialog,
+                            &mut windows.ctx,
+                            op,
+                            &windows.global_functions,
+                        );
+                        if ret == FunctionRetval::Abort {
+                            break;
+                        }
+                        if ret != FunctionRetval::Unhandled {
+                            windows.state().dirty.help_bar.set(true);
                         }
                     }
                 }
