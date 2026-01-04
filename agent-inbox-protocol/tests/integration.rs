@@ -47,6 +47,7 @@ mod integration {
             keywords: Some(vec!["integration".to_string()]),
             max_per_inbox: Some(10),
             max_across_inboxes: Some(10),
+            ..Default::default()
         };
 
         let provider = DummyProvider {

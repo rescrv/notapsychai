@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 chrono = { workspace = true }
+claudius = { version = "0.16", path = "../../claudius" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 reqwest = { version = "0.12", optional = true, features = ["json"] }
 axum = { workspace = true, optional = true }
 tokio = { version = "1", optional = true, features = ["sync"] }
