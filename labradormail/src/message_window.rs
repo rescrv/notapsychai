@@ -3,30 +3,31 @@
 //! The message window displays status messages and prompts at the bottom
 //! of the screen. It supports multi-line messages and colored text.
 
-use std::cell::RefCell;
 use std::io::Result;
 use std::io::Write;
-use std::rc::Rc;
 
+use crate::context::AttrColor;
+use crate::context::ColorId;
 use crate::context::GuiContext;
-use crate::curs_lib::mutt_char_width;
-use crate::mutt_curses::mutt_curses_set_color;
-use crate::mutt_curses::mutt_curses_set_color_by_id;
-use crate::mutt_curses::mutt_curses_set_cursor;
-use crate::mutt_curses::AttrColor;
-use crate::mutt_curses::ColorId;
+use crate::curs_lib::char_width;
+use crate::render::Renderer;
 use crate::window::handle_observer_delete;
+use crate::window::CursorBehavior;
 use crate::window::CursorState;
 use crate::window::EventWindow;
 use crate::window::HasObserverId;
-use crate::window::MuttWindow;
 use crate::window::NotifyWindow;
-use crate::window::WindowActionFlags;
+use crate::window::RenderMode;
+use crate::window::WindowId;
 use crate::window::WindowNotifyFlags;
 use crate::window::WindowOrientation;
 use crate::window::WindowSize;
+use crate::window::WindowTree;
 use crate::window::WindowType;
-use crate::MSGWIN_MAX_ROWS;
+use crate::window::WindowWidget;
+
+/// Maximum number of rows for message window.
+pub const MSGWIN_MAX_ROWS: usize = 3;
 
 /// Description of a single character.
 #[derive(Debug, Clone, Default)]
@@ -48,7 +49,7 @@ impl MwChar {
     /// - Wide characters (CJK, emoji) have width 2
     /// - Variation selectors have width 0
     pub fn measure(ch: char, color: AttrColor) -> Self {
-        let width = mutt_char_width(ch) as u8;
+        let width = char_width(ch) as u8;
         Self {
             width,
             bytes: ch.len_utf8() as u8,
@@ -83,6 +84,8 @@ pub struct MsgWinWindowData {
     pub row: i32,
     /// Cursor column.
     pub col: i32,
+    /// Whether this message window handles cursor positioning.
+    pub interactive: bool,
     /// Observer ID for window events.
     pub window_observer_id: Option<u64>,
 }
@@ -90,6 +93,83 @@ pub struct MsgWinWindowData {
 impl HasObserverId for MsgWinWindowData {
     fn take_observer_id(&mut self) -> Option<u64> {
         self.window_observer_id.take()
+    }
+}
+
+impl MsgWinWindowData {
+    pub fn update(&mut self, tree: &mut WindowTree, win: WindowId) {
+        let win_width = tree.get(win).state.rect.size.cols;
+        let needed_rows = self.calc_rows(win_width).clamp(1, MSGWIN_MAX_ROWS as i16);
+
+        let win_ref = tree.get_mut(win);
+        let current_cols = win_ref.req_size.cols;
+        win_ref.set_req_size(current_cols, needed_rows);
+        win_ref.mark_repaint();
+    }
+
+    pub fn render(
+        &mut self,
+        tree: &mut WindowTree,
+        win: WindowId,
+        ctx: &mut GuiContext,
+        out: &mut dyn Write,
+        mode: RenderMode,
+    ) -> Result<CursorBehavior> {
+        if matches!(mode, RenderMode::Paint) {
+            let text = self.text.clone();
+            let rows = self.rows.clone();
+            let window = tree.get(win);
+            let mut renderer = Renderer::new(ctx, out);
+
+            let mut painted = false;
+            for (row_idx, row_chunks) in rows.iter().enumerate() {
+                if row_chunks.is_empty() {
+                    continue;
+                }
+                painted = true;
+                renderer.move_cursor(window, row_idx as i16, 0)?;
+                for chunk in row_chunks {
+                    let start = chunk.offset as usize;
+                    let end = start + chunk.bytes as usize;
+                    let slice = text.get(start..end).unwrap_or("");
+                    renderer.set_color(&chunk.color)?;
+                    renderer.write_str(slice)?;
+                }
+                renderer.set_color_by_id(ColorId::Normal)?;
+                renderer.clrtoeol()?;
+            }
+
+            if !painted {
+                renderer.set_color_by_id(ColorId::Normal)?;
+                let rows = window.state.rect.size.rows;
+                for row in 0..rows {
+                    renderer.move_cursor(window, row, 0)?;
+                    renderer.clrtoeol()?;
+                }
+            }
+        }
+
+        // Calculate cursor position after text is drawn.
+        let mut final_row = 0i32;
+        let mut final_col = 0i32;
+        for (row_idx, row_chunks) in self.rows.iter().enumerate() {
+            if row_chunks.is_empty() {
+                break;
+            }
+            final_row = row_idx as i32;
+            final_col = row_chunks.iter().map(|c| c.width as i32).sum();
+        }
+        self.row = final_row;
+        self.col = final_col;
+
+        if !self.interactive {
+            return Ok(CursorBehavior::Hidden);
+        }
+        Ok(CursorBehavior::Positioned {
+            row: self.row as i16,
+            col: self.col as i16,
+            state: CursorState::Visible,
+        })
     }
 }
 
@@ -185,7 +265,10 @@ impl MsgWinWindowData {
                 });
                 chunk = Some(self.rows[row].len() - 1);
                 width = 0;
-            } else if chunk.is_none() || self.rows[row][chunk.unwrap()].color != mw_char.color {
+            } else if chunk
+                .and_then(|chunk_idx| self.rows[row].get(chunk_idx))
+                .is_none_or(|row_chunk| row_chunk.color != mw_char.color)
+            {
                 self.rows[row].push(MwChunk {
                     offset: offset as u16,
                     bytes: mw_char.bytes as u16,
@@ -226,7 +309,7 @@ impl MsgWinWindowData {
 ///
 /// Provides a high-level interface for the message window.
 pub struct MessageWindow {
-    window: Rc<RefCell<MuttWindow>>,
+    window: WindowId,
     /// Whether this message window is interactive (active) or passive.
     /// Active windows handle their own drawing, passive windows don't.
     interactive: bool,
@@ -237,10 +320,10 @@ impl MessageWindow {
     ///
     /// If `interactive` is true, the window is active and handles its own drawing.
     /// If false, it's passive and drawing is handled externally.
-    pub fn new(interactive: bool) -> Self {
+    pub fn new(tree: &mut WindowTree, interactive: bool) -> Self {
         let rows = 1;
 
-        let window = MuttWindow::new(
+        let window = tree.add_window(
             WindowType::Message,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
@@ -249,19 +332,15 @@ impl MessageWindow {
         );
 
         {
-            let mut borrowed = window.borrow_mut();
-            borrowed.wdata = Some(Box::new(MsgWinWindowData::new()));
-            borrowed.recalc = Some(msgwin_recalc);
-            borrowed.repaint = Some(msgwin_repaint);
-            borrowed.draw = Some(msgwin_draw);
-            if interactive {
-                borrowed.recursor = Some(msgwin_recursor);
-            }
+            let borrowed = tree.get_mut(window);
+            let mut widget_data = MsgWinWindowData::new();
+            widget_data.interactive = interactive;
+            borrowed.set_widget(WindowWidget::MessageWindow(widget_data));
         }
-        let observer_id = window.borrow_mut().add_observer(msgwin_window_observer);
+        let observer_id = tree.get_mut(window).add_observer(msgwin_window_observer);
         {
-            let mut borrowed = window.borrow_mut();
-            if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
+            let borrowed = tree.get_mut(window);
+            if let Some(WindowWidget::MessageWindow(data)) = borrowed.widget_mut() {
                 data.window_observer_id = Some(observer_id);
             }
         }
@@ -272,9 +351,9 @@ impl MessageWindow {
         }
     }
 
-    /// Returns a reference to the underlying window.
-    pub fn window(&self) -> &Rc<RefCell<MuttWindow>> {
-        &self.window
+    /// Returns the underlying window ID.
+    pub fn window_id(&self) -> WindowId {
+        self.window
     }
 
     /// Returns whether this message window is interactive (active).
@@ -283,183 +362,85 @@ impl MessageWindow {
     }
 
     /// Sets the message text.
-    pub fn set_text(&self, ctx: &GuiContext, text: &str, color: ColorId) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
+    pub fn set_text(&self, tree: &mut WindowTree, ctx: &GuiContext, text: &str, color: ColorId) {
+        let borrowed = tree.get_mut(self.window);
+        if let Some(WindowWidget::MessageWindow(data)) = borrowed.widget_mut() {
             data.set_text(ctx, text, color);
         }
-        borrowed.actions |= WindowActionFlags::RECALC | WindowActionFlags::REPAINT;
+        borrowed.mark_recalc_repaint();
     }
 
     /// Sets the message text with an explicit color.
-    pub fn set_text_with_color(&self, text: &str, color: AttrColor) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
+    pub fn set_text_with_color(&self, tree: &mut WindowTree, text: &str, color: AttrColor) {
+        let borrowed = tree.get_mut(self.window);
+        if let Some(WindowWidget::MessageWindow(data)) = borrowed.widget_mut() {
             data.set_text_with_color(text, color);
         }
-        borrowed.actions |= WindowActionFlags::RECALC | WindowActionFlags::REPAINT;
+        borrowed.mark_recalc_repaint();
     }
 
     /// Adds text to the message.
-    pub fn add_text(&self, text: &str, color: AttrColor) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
+    pub fn add_text(&self, tree: &mut WindowTree, text: &str, color: AttrColor) {
+        let borrowed = tree.get_mut(self.window);
+        if let Some(WindowWidget::MessageWindow(data)) = borrowed.widget_mut() {
             data.add_text(text, color);
         }
-        borrowed.actions |= WindowActionFlags::RECALC | WindowActionFlags::REPAINT;
+        borrowed.mark_recalc_repaint();
     }
 
     /// Clears the message text.
-    pub fn clear_text(&self) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
+    pub fn clear_text(&self, tree: &mut WindowTree) {
+        let borrowed = tree.get_mut(self.window);
+        if let Some(WindowWidget::MessageWindow(data)) = borrowed.widget_mut() {
             data.clear();
         }
-        borrowed.actions |= WindowActionFlags::RECALC | WindowActionFlags::REPAINT;
+        borrowed.mark_recalc_repaint();
     }
 
     /// Gets the current message text.
-    pub fn text(&self) -> Option<String> {
-        let borrowed = self.window.borrow();
-        borrowed
-            .wdata_ref::<MsgWinWindowData>()
-            .map(|data| data.text.clone())
-    }
-
-    /// Sets the number of rows for the message window.
-    pub fn set_rows(&self, rows: i16) {
-        let mut borrowed = self.window.borrow_mut();
-        let clamped = rows.clamp(1, MSGWIN_MAX_ROWS as i16);
-        if borrowed.req_rows != clamped {
-            borrowed.req_rows = clamped;
-            borrowed.actions |= WindowActionFlags::REFLOW;
+    pub fn text(&self, tree: &WindowTree) -> Option<String> {
+        if let Some(WindowWidget::MessageWindow(data)) = tree.get(self.window).widget_ref() {
+            Some(data.text.clone())
+        } else {
+            None
         }
     }
 
+    /// Sets the number of rows for the message window.
+    pub fn set_rows(&self, tree: &mut WindowTree, rows: i16) {
+        let win = tree.get_mut(self.window);
+        let clamped = rows.clamp(1, MSGWIN_MAX_ROWS as i16);
+        let current_cols = win.req_size.cols;
+        win.set_req_size(current_cols, clamped);
+    }
+
     /// Gets the message window data.
-    pub fn data(&self) -> Option<MsgWinWindowData> {
-        let borrowed = self.window.borrow();
-        borrowed.wdata_ref::<MsgWinWindowData>().cloned()
+    pub fn data(&self, tree: &WindowTree) -> Option<MsgWinWindowData> {
+        if let Some(WindowWidget::MessageWindow(data)) = tree.get(self.window).widget_ref() {
+            Some(data.clone())
+        } else {
+            None
+        }
     }
 
     /// Sets the cursor position within the message window.
-    pub fn set_cursor(&self, row: i32, col: i32) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
+    pub fn set_cursor(&self, tree: &mut WindowTree, row: i32, col: i32) {
+        let win = tree.get_mut(self.window);
+        if let Some(WindowWidget::MessageWindow(data)) = win.widget_mut() {
             data.row = row;
             data.col = col;
         }
     }
 }
 
-/// Recalculate callback for message window.
-///
-/// Following NeoMutt's pattern: recalc requests repaint and calculates row layout.
-fn msgwin_recalc(win: &mut MuttWindow) {
-    let win_width = win.state.cols;
-
-    if let Some(data) = win.wdata_mut::<MsgWinWindowData>() {
-        let needed_rows = data.calc_rows(win_width).clamp(1, MSGWIN_MAX_ROWS as i16);
-
-        // Update req_rows if changed (to trigger reflow if needed)
-        if win.req_rows != needed_rows {
-            win.req_rows = needed_rows;
-            win.actions |= WindowActionFlags::REFLOW;
-        }
-    }
-
-    win.actions |= WindowActionFlags::REPAINT;
-}
-
-/// Repaint callback for message window.
-///
-/// In NeoMutt, this function draws directly using curses functions.
-/// In our crossterm implementation, the MsgWinWindowData contains all
-/// information needed to render (text, rows with chunks, cursor position).
-///
-/// The actual terminal output happens in the draw phase which has write access.
-/// This callback computes the final cursor position after drawing would complete.
-fn msgwin_repaint(win: &mut MuttWindow) {
-    if let Some(data) = win.wdata_mut::<MsgWinWindowData>() {
-        // Calculate cursor position after text is drawn
-        // This mimics NeoMutt's mutt_window_get_coords at end of repaint
-        let mut final_row = 0i32;
-        let mut final_col = 0i32;
-
-        for (row_idx, row_chunks) in data.rows.iter().enumerate() {
-            if row_chunks.is_empty() {
-                break;
-            }
-            final_row = row_idx as i32;
-            final_col = row_chunks.iter().map(|c| c.width as i32).sum();
-        }
-
-        data.row = final_row;
-        data.col = final_col;
-    }
-}
-
-fn msgwin_draw(win: &mut MuttWindow, ctx: &mut GuiContext, out: &mut dyn Write) -> Result<()> {
-    let Some(data) = win.wdata_ref::<MsgWinWindowData>() else {
-        return Ok(());
-    };
-    let text = data.text.clone();
-    let rows = data.rows.clone();
-
-    let mut painted = false;
-    for (row_idx, row_chunks) in rows.iter().enumerate() {
-        if row_chunks.is_empty() {
-            continue;
-        }
-        painted = true;
-        win.move_cursor(out, row_idx as i16, 0)?;
-        for chunk in row_chunks {
-            let start = chunk.offset as usize;
-            let end = start + chunk.bytes as usize;
-            let slice = text.get(start..end).unwrap_or("");
-            mutt_curses_set_color(ctx, out, &chunk.color)?;
-            win.addstr(out, slice)?;
-        }
-        mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
-        win.clrtoeol(ctx, out)?;
-    }
-
-    if !painted {
-        mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
-        for row in 0..win.state.rows {
-            win.move_cursor(out, row, 0)?;
-            win.clrtoeol(ctx, out)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn msgwin_recursor(win: &mut MuttWindow, ctx: &mut GuiContext, out: &mut dyn Write) -> bool {
-    let Some(data) = win.wdata_ref::<MsgWinWindowData>() else {
-        return false;
-    };
-    let row = data.row;
-    let col = data.col;
-
-    if win.move_cursor(out, row as i16, col as i16).is_err() {
-        return false;
-    }
-    let _ = mutt_curses_set_cursor(ctx, out, CursorState::Visible);
-    true
-}
-
-fn msgwin_window_observer(notify_type: NotifyWindow, event: &EventWindow) {
-    let win = match event.win.upgrade() {
-        Some(win) => win,
-        None => return,
-    };
-
+fn msgwin_window_observer(notify_type: NotifyWindow, event: &EventWindow, tree: &mut WindowTree) {
     match notify_type {
         NotifyWindow::State => {
             let flags = event.flags;
             if flags.contains(WindowNotifyFlags::HIDDEN) {
-                if let Some(data) = win.borrow_mut().wdata_mut::<MsgWinWindowData>() {
+                if let Some(WindowWidget::MessageWindow(data)) =
+                    tree.get_mut(event.win).widget_mut()
+                {
                     data.clear();
                 }
             }
@@ -467,23 +448,25 @@ fn msgwin_window_observer(notify_type: NotifyWindow, event: &EventWindow) {
             if flags.contains(WindowNotifyFlags::WIDER)
                 || flags.contains(WindowNotifyFlags::NARROWER)
             {
-                let mut borrowed = win.borrow_mut();
-                let cols = borrowed.state.cols;
-                if let Some(data) = borrowed.wdata_mut::<MsgWinWindowData>() {
-                    let needed_rows = data.calc_rows(cols);
-                    let clamped = needed_rows.clamp(1, MSGWIN_MAX_ROWS as i16);
-                    if borrowed.req_rows != clamped {
-                        borrowed.req_rows = clamped;
-                        borrowed.actions |= WindowActionFlags::REFLOW;
-                    }
-                }
-                borrowed.actions |= WindowActionFlags::RECALC;
+                let cols = tree.get(event.win).state.rect.size.cols;
+                let clamped = {
+                    let Some(WindowWidget::MessageWindow(data)) =
+                        tree.get_mut(event.win).widget_mut()
+                    else {
+                        return;
+                    };
+                    data.calc_rows(cols).clamp(1, MSGWIN_MAX_ROWS as i16)
+                };
+                let win_ref = tree.get_mut(event.win);
+                let current_cols = win_ref.req_size.cols;
+                win_ref.set_req_size(current_cols, clamped);
+                win_ref.mark_recalc();
             } else {
-                win.borrow_mut().actions |= WindowActionFlags::REPAINT;
+                tree.get_mut(event.win).mark_repaint();
             }
         }
         NotifyWindow::Delete => {
-            handle_observer_delete::<MsgWinWindowData>(&win);
+            handle_observer_delete(tree, event.win);
         }
         _ => {}
     }
@@ -492,6 +475,7 @@ fn msgwin_window_observer(notify_type: NotifyWindow, event: &EventWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::WindowActionFlags;
     use crossterm::style::Color;
 
     fn ac(color: Color) -> AttrColor {
@@ -529,29 +513,35 @@ mod tests {
 
     #[test]
     fn message_window_create() {
-        let msgwin = MessageWindow::new(true);
-        assert_eq!(msgwin.window().borrow().req_rows, 1);
-        assert_eq!(msgwin.window().borrow().window_type, WindowType::Message);
+        let mut tree = WindowTree::new();
+        let msgwin = MessageWindow::new(&mut tree, true);
+        assert_eq!(tree.get(msgwin.window_id()).req_size.rows, 1);
+        assert_eq!(
+            tree.get(msgwin.window_id()).window_type,
+            WindowType::Message
+        );
     }
 
     #[test]
     fn message_window_set_text() {
         let ctx = GuiContext::new();
-        let msgwin = MessageWindow::new(true);
-        msgwin.set_text(&ctx, "Test message", ColorId::Message);
+        let mut tree = WindowTree::new();
+        let msgwin = MessageWindow::new(&mut tree, true);
+        msgwin.set_text(&mut tree, &ctx, "Test message", ColorId::Message);
 
-        let text = msgwin.text();
+        let text = msgwin.text(&tree);
         assert!(text.is_some());
         assert_eq!(text.unwrap(), "Test message");
     }
 
     #[test]
     fn message_window_set_rows() {
-        let msgwin = MessageWindow::new(true);
-        assert_eq!(msgwin.window().borrow().req_rows, 1);
+        let mut tree = WindowTree::new();
+        let msgwin = MessageWindow::new(&mut tree, true);
+        assert_eq!(tree.get(msgwin.window_id()).req_size.rows, 1);
 
-        msgwin.set_rows(3);
-        assert_eq!(msgwin.window().borrow().req_rows, 3);
+        msgwin.set_rows(&mut tree, 3);
+        assert_eq!(tree.get(msgwin.window_id()).req_size.rows, 3);
     }
 
     #[test]
@@ -688,10 +678,11 @@ mod tests {
 
     #[test]
     fn message_window_interactive_flag() {
-        let active = MessageWindow::new(true);
+        let mut tree = WindowTree::new();
+        let active = MessageWindow::new(&mut tree, true);
         assert!(active.is_interactive());
 
-        let passive = MessageWindow::new(false);
+        let passive = MessageWindow::new(&mut tree, false);
         assert!(!passive.is_interactive());
     }
 
@@ -709,41 +700,44 @@ mod tests {
     #[test]
     fn msgwin_observer_reflows_on_width_change() {
         let ctx = GuiContext::new();
-        let msgwin = MessageWindow::new(true);
-        msgwin.set_text(&ctx, "1234567", ColorId::Message);
+        let mut tree = WindowTree::new();
+        let msgwin = MessageWindow::new(&mut tree, true);
+        msgwin.set_text(&mut tree, &ctx, "1234567", ColorId::Message);
 
         {
-            let mut win = msgwin.window().borrow_mut();
-            win.state.cols = 3;
+            let win = tree.get_mut(msgwin.window_id());
+            win.state.rect.size.cols = 3;
             win.actions = WindowActionFlags::empty();
         }
 
         let event = EventWindow {
-            win: Rc::downgrade(msgwin.window()),
+            win: msgwin.window_id(),
             flags: WindowNotifyFlags::WIDER,
         };
-        msgwin_window_observer(NotifyWindow::State, &event);
+        msgwin_window_observer(NotifyWindow::State, &event, &mut tree);
 
-        let win = msgwin.window().borrow();
+        let win = tree.get(msgwin.window_id());
         assert!(win.actions.contains(WindowActionFlags::RECALC));
         assert!(win.actions.contains(WindowActionFlags::REFLOW));
-        assert!(win.req_rows > 1);
+        assert!(win.req_size.rows > 1);
     }
 
     #[test]
     fn msgwin_draw_outputs_text() {
         let mut ctx = GuiContext::new();
-        let msgwin = MessageWindow::new(true);
-        msgwin.set_text(&ctx, "Hello", ColorId::Message);
+        let mut tree = WindowTree::new();
+        let msgwin = MessageWindow::new(&mut tree, true);
+        msgwin.set_text(&mut tree, &ctx, "Hello", ColorId::Message);
         {
-            let mut win = msgwin.window().borrow_mut();
-            win.state.cols = 10;
-            msgwin_recalc(&mut win);
+            let win = tree.get_mut(msgwin.window_id());
+            win.state.rect.size.cols = 10;
+            win.state.visible = true;
+            win.mark_recalc_repaint();
         }
         let mut out = Vec::new();
-        let mut win = msgwin.window().borrow_mut();
-        msgwin_draw(&mut win, &mut ctx, &mut out).unwrap();
+        // Use redraw to trigger recalc and draw through the widget path.
+        tree.redraw(msgwin.window_id(), &mut ctx, &mut out).unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Hello"));
+        assert!(output.contains("Hello"), "output = {}", output);
     }
 }

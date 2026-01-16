@@ -198,6 +198,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e050f626429857a27ddccb31e0aca21356bfa709c04041aefddac081a8f068a"
 
 [[package]]
+name = "biometrics"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45f7064e02662745f850952e2193fbb22ee2c9375b1e16b57978f46074f62473"
+dependencies = [
+ "sig_fig_histogram",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +357,7 @@ dependencies = [
  "arrrg_derive",
  "async-trait",
  "base64 0.21.7",
+ "biometrics",
  "bytes",
  "ctrlc",
  "futures",
@@ -1591,6 +1601,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "indicio"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11df3ad4b2df429af697eb72db720b98b3721e14d069396f9554de023246fdfe"
+dependencies = [
+ "biometrics",
+ "buffertk",
+ "prototk",
+ "prototk_derive",
+ "tatl",
+]
+
+[[package]]
 name = "indoc"
 version = "2.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1709,11 +1732,13 @@ dependencies = [
  "agent-inbox-protocol",
  "async-trait",
  "axum",
+ "biometrics",
  "bitflags 2.10.0",
  "chrono",
  "claudius",
  "crossterm",
  "futures",
+ "indicio",
  "rc_conf",
  "reqwest 0.12.28",
  "serde_json",
@@ -3108,6 +3133,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db00e54a0348dddbe3faac9249821db0388ae40a50d2621c4fea880d11ae21c9"
 
 [[package]]
+name = "sig_fig_histogram"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2261fd0eac75e2887b4ccceb4a11aa9dbb99e27b5f9011f8f7029da16bbb3e43"
+
+[[package]]
 name = "signal-hook"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3560,6 +3591,17 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "tatl"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69d3a2b834cafac27fd365555a0bf9ba90ca05d20ed57cf8e2c99d294fc00655"
+dependencies = [
+ "biometrics",
+ "one_two_eight",
+ "prototk",
 ]
 
 [[package]]

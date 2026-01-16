@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
-use claudius::ToolParam;
-
+pub use claudius::ToolParam;
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
@@ -28,7 +27,7 @@ macro_rules! typed_string {
     };
 }
 
-///////////////////////////////////////////// MessageId /////////////////////////////////////////////
+///////////////////////////////////////////// MessageID /////////////////////////////////////////////
 
 #[derive(
     Clone,
@@ -42,10 +41,10 @@ macro_rules! typed_string {
     serde::Deserialize,
     serde::Serialize,
 )]
-pub struct MessageId(String);
-typed_string!(MessageId);
+pub struct MessageID(String);
+typed_string!(MessageID);
 
-impl MessageId {
+impl MessageID {
     pub fn validate(_: &str) -> Option<()> {
         Some(())
     }
@@ -124,12 +123,12 @@ impl Body {
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Message {
-    pub msg_id: MessageId,
+    pub msg_id: MessageID,
     pub date: DateTime<Utc>,
     pub from: From,
     pub body: Body,
     pub wrap: bool,
-    pub actions: Vec<ToolParam>,
+    pub tools: Vec<claudius::ToolParam>,
 }
 
 ////////////////////////////////////////////// Mailbox /////////////////////////////////////////////
@@ -205,35 +204,38 @@ impl QueryResult {
 pub trait MailboxProvider {
     type Error: std::error::Error;
     async fn query(&mut self, query: QueryParameters) -> Result<QueryResult, Self::Error>;
-    async fn action(&mut self, request: ActionRequest) -> Result<ActionResponse, Self::Error>;
+    async fn tool_call(
+        &mut self,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResponse, Self::Error>;
 }
 
-////////////////////////////////////////// ActionRequest ///////////////////////////////////////////
+////////////////////////////////////////// ToolCallRequest /////////////////////////////////////////
 
-/// Request to perform an action on a message.
+/// Request to perform a tool call on a message.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct ActionRequest {
-    /// The message ID to act upon.
-    pub message_id: MessageId,
-    /// The name of the tool/action to perform.
+pub struct ToolCallRequest {
+    /// The message ID to target.
+    pub message_id: MessageID,
+    /// The name of the tool to perform.
     pub name: String,
     /// The input payload for the tool, matching the tool's input_schema.
     pub input: serde_json::Value,
 }
 
-////////////////////////////////////////// ActionResponse //////////////////////////////////////////
+////////////////////////////////////////// ToolCallResponse ////////////////////////////////////////
 
-/// Response from an action request.
+/// Response from a tool call request.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
-pub struct ActionResponse {
-    /// Whether the action succeeded.
+pub struct ToolCallResponse {
+    /// Whether the tool call succeeded.
     pub success: bool,
     /// Optional message describing the result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
-impl ActionResponse {
+impl ToolCallResponse {
     /// Creates a successful response.
     pub fn success() -> Self {
         Self {
@@ -262,10 +264,11 @@ impl ActionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claudius::ToolParam;
 
     #[test]
-    fn message_with_tool_param_actions() {
-        let action = ToolParam {
+    fn message_with_tool_param_tools() {
+        let tool = ToolParam {
             name: "done".to_string(),
             description: Some("Mark as done".to_string()),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -273,28 +276,28 @@ mod tests {
         };
 
         let message = Message {
-            msg_id: MessageId::new("msg-1").unwrap(),
+            msg_id: MessageID::new("msg-1").unwrap(),
             date: Utc::now(),
             from: From::new("test@example.com").unwrap(),
             body: Body::new("Test").unwrap(),
             wrap: false,
-            actions: vec![action],
+            tools: vec![tool],
         };
 
-        assert_eq!(message.actions.len(), 1);
-        assert_eq!(message.actions[0].name, "done");
+        assert_eq!(message.tools.len(), 1);
+        assert_eq!(message.tools[0].name, "done");
         assert_eq!(
-            message.actions[0].description,
+            message.tools[0].description,
             Some("Mark as done".to_string())
         );
         // Verify input_schema is as expected.
-        println!("input_schema: {:?}", message.actions[0].input_schema);
+        println!("input_schema: {:?}", message.tools[0].input_schema);
     }
 
     #[test]
-    fn action_request_with_input() {
-        let request = ActionRequest {
-            message_id: MessageId::new("msg-1").unwrap(),
+    fn tool_call_request_with_input() {
+        let request = ToolCallRequest {
+            message_id: MessageID::new("msg-1").unwrap(),
             name: "defer".to_string(),
             input: serde_json::json!({"days": 3}),
         };

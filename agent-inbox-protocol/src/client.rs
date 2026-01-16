@@ -1,4 +1,4 @@
-use crate::{ActionRequest, ActionResponse, MailboxProvider, QueryParameters, QueryResult};
+use crate::{MailboxProvider, QueryParameters, QueryResult, ToolCallRequest, ToolCallResponse};
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -24,8 +24,8 @@ impl Client {
         format!("{}/query", self.base_url.trim_end_matches('/'))
     }
 
-    fn action_url(&self) -> String {
-        format!("{}/action", self.base_url.trim_end_matches('/'))
+    fn call_url(&self) -> String {
+        format!("{}/call", self.base_url.trim_end_matches('/'))
     }
 }
 
@@ -45,14 +45,17 @@ impl MailboxProvider for Client {
         Ok(result)
     }
 
-    async fn action(&mut self, request: ActionRequest) -> Result<ActionResponse, Self::Error> {
+    async fn tool_call(
+        &mut self,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResponse, Self::Error> {
         let response = self
             .http
-            .post(self.action_url())
+            .post(self.call_url())
             .json(&request)
             .send()
             .await?
             .error_for_status()?;
-        response.json::<ActionResponse>().await
+        response.json::<ToolCallResponse>().await
     }
 }

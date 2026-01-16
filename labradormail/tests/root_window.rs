@@ -1,17 +1,21 @@
-use labradormail::RootWindow;
-use labradormail::WindowType;
+use labradormail::prelude::*;
 
 #[test]
-fn root_window_accessors_return_expected_windows() {
-    let root = RootWindow::new_with_size((80, 24)).unwrap();
-    assert_eq!(root.root().borrow().window_type, WindowType::Root);
-    assert_eq!(root.help_bar().borrow().window_type, WindowType::HelpBar);
+fn root_window_accessors_return_expected_windows() -> std::io::Result<()> {
+    let root = RootWindow::new_with_size((80, 24))?;
+    let tree = root.tree();
+    assert_eq!(tree.get(root.root_id()).window_type, WindowType::Root);
     assert_eq!(
-        root.all_dialogs().borrow().window_type,
+        tree.get(root.help_bar_id()).window_type,
+        WindowType::HelpBar
+    );
+    assert_eq!(
+        tree.get(root.all_dialogs_id()).window_type,
         WindowType::AllDialogs
     );
     assert_eq!(
-        root.message_container().borrow().window_type,
+        tree.get(root.message_container_id()).window_type,
         WindowType::Container
     );
+    Ok(())
 }

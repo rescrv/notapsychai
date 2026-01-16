@@ -2,33 +2,33 @@
 //!
 //! Displays a simple list of key bindings in a dialog window.
 
-use std::cell::RefCell;
 use std::io::Result;
 use std::io::Write;
-use std::rc::Rc;
 
-use crossterm::style::Print;
-use crossterm::ExecutableCommand;
-
+use crate::action::Action;
+use crate::context::ColorId;
 use crate::context::GuiContext;
-use crate::curs_lib::mutt_paddstr_string;
-use crate::dialog::Dialog;
+use crate::curs_lib::pad_string;
+use crate::curs_lib::ScrollState;
 use crate::help_data::HelpData;
 use crate::help_data::HelpItem;
-use crate::mutt_curses::mutt_curses_set_color_by_id;
-use crate::mutt_curses::ColorId;
+use crate::render::Renderer;
 use crate::sbar::StatusBar;
-use crate::window::MuttWindow;
-use crate::window::WindowActionFlags;
+use crate::window::CursorBehavior;
+use crate::window::RenderMode;
+use crate::window::WindowId;
 use crate::window::WindowOrientation;
 use crate::window::WindowSize;
+use crate::window::WindowTree;
 use crate::window::WindowType;
+use crate::window::WindowWidget;
 
 #[derive(Debug, Clone)]
-struct HelpDialogContentData {
+pub struct HelpDialogContentData {
     items: Vec<HelpItem>,
     formatted: Vec<String>,
     last_width: i16,
+    scroll: ScrollState,
 }
 
 impl HelpDialogContentData {
@@ -37,6 +37,7 @@ impl HelpDialogContentData {
             items,
             formatted: Vec::new(),
             last_width: -1,
+            scroll: ScrollState::new(),
         }
     }
 
@@ -65,29 +66,70 @@ impl HelpDialogContentData {
                 item.description,
                 width = key_width
             );
-            self.formatted
-                .push(mutt_paddstr_string(&line, width as usize));
+            self.formatted.push(pad_string(&line, width as usize));
         }
+    }
+}
+
+impl HelpDialogContentData {
+    pub fn update(&mut self, tree: &mut WindowTree, win: WindowId) {
+        let width = tree.get(win).state.rect.size.cols;
+        self.ensure_formatted(width);
+        tree.get_mut(win).mark_repaint();
+    }
+
+    pub fn render(
+        &mut self,
+        tree: &mut WindowTree,
+        win: WindowId,
+        ctx: &mut GuiContext,
+        out: &mut dyn Write,
+        mode: RenderMode,
+    ) -> Result<CursorBehavior> {
+        if matches!(mode, RenderMode::CursorOnly) {
+            return Ok(CursorBehavior::Hidden);
+        }
+        let width = tree.get(win).state.rect.size.cols;
+        let rows = tree.get(win).state.rect.size.rows;
+        self.ensure_formatted(width);
+        let lines = self.formatted.clone();
+        let scroll_offset = self.scroll.offset();
+        let width = width.max(0) as usize;
+        let mut renderer = Renderer::new(ctx, out);
+        for row in 0..rows {
+            renderer.move_cursor(tree.get(win), row, 0)?;
+            let line_idx = scroll_offset + row as usize;
+            let color = if line_idx.is_multiple_of(2) {
+                ColorId::StripeEven
+            } else {
+                ColorId::StripeOdd
+            };
+            renderer.set_color_by_id(color)?;
+
+            let line = lines
+                .get(line_idx)
+                .cloned()
+                .unwrap_or_else(|| " ".repeat(width));
+            renderer.write_str(&line)?;
+        }
+        Ok(CursorBehavior::Hidden)
     }
 }
 
 /// Help dialog window wrapper.
 pub struct HelpDialog {
-    window: Rc<RefCell<MuttWindow>>,
+    window: WindowId,
 }
 
 impl HelpDialog {
     /// Creates a new help dialog for the given help data.
-    pub fn new(help_data: &HelpData) -> Self {
-        let dialog = Dialog::new(WindowType::DlgHelp);
+    pub fn new(tree: &mut WindowTree, help_data: &HelpData) -> Self {
+        let dialog = tree.add_dialog(WindowType::DlgHelp);
         {
-            let mut borrowed = dialog.window().borrow_mut();
-            borrowed.help_data = Some(Rc::new(HelpData::from_items(vec![HelpItem::new(
-                "q",
-                "Close help",
-            )])));
+            let borrowed = tree.get_mut(dialog);
+            borrowed.help_data = Some(HelpData::from_items(vec![HelpItem::new("q", "Close help")]));
         }
-        let content = MuttWindow::new(
+        let content = tree.add_window(
             WindowType::Custom,
             WindowOrientation::Vertical,
             WindowSize::Maximise,
@@ -95,69 +137,85 @@ impl HelpDialog {
             0,
         );
         {
-            let mut borrowed = content.borrow_mut();
-            borrowed.wdata = Some(Box::new(HelpDialogContentData::new(
+            let borrowed = tree.get_mut(content);
+            borrowed.set_widget(WindowWidget::HelpDialog(HelpDialogContentData::new(
                 help_data.items.clone(),
             )));
-            borrowed.recalc = Some(help_dialog_recalc);
-            borrowed.draw = Some(help_dialog_draw);
         }
 
-        let sbar = StatusBar::new();
-        sbar.set_title("Help - press q to close");
+        let sbar = StatusBar::new(tree);
+        sbar.set_title(tree, "Help - press q to close");
 
-        Dialog::add_child(&dialog, Rc::clone(&content));
-        Dialog::add_child(&dialog, Rc::clone(sbar.window()));
+        tree.add_child(dialog, content);
+        tree.add_child(dialog, sbar.window_id());
 
-        Self {
-            window: Rc::clone(dialog.window()),
-        }
+        Self { window: dialog }
     }
 
-    /// Returns a reference to the underlying dialog window.
-    pub fn window(&self) -> &Rc<RefCell<MuttWindow>> {
-        &self.window
+    /// Returns the underlying dialog window ID.
+    pub fn window_id(&self) -> WindowId {
+        self.window
     }
 }
 
-fn help_dialog_recalc(win: &mut MuttWindow) {
-    let width = win.state.cols;
-    if let Some(data) = win.wdata_mut::<HelpDialogContentData>() {
-        data.ensure_formatted(width);
+/// Scrolls the help dialog content if the window is a help dialog.
+///
+/// Returns true if the scroll was handled.
+pub fn help_dialog_scroll(tree: &mut WindowTree, win: WindowId, action: Action) -> bool {
+    if tree.get(win).window_type != WindowType::DlgHelp {
+        return false;
     }
-    win.actions |= WindowActionFlags::REPAINT;
-}
 
-fn help_dialog_draw(win: &mut MuttWindow, ctx: &mut GuiContext, out: &mut dyn Write) -> Result<()> {
-    let width = win.state.cols;
-    let Some(data) = win.wdata_mut::<HelpDialogContentData>() else {
-        return Ok(());
+    let content = tree
+        .get(win)
+        .children
+        .iter()
+        .copied()
+        .find(|child| tree.get(*child).window_type == WindowType::Custom);
+
+    let Some(content) = content else {
+        return false;
     };
-    data.ensure_formatted(width);
-    let lines = data.formatted.clone();
-    let width = width.max(0) as usize;
 
-    for row in 0..win.state.rows {
-        win.move_cursor(out, row, 0)?;
-        let color = if row % 2 == 0 {
-            ColorId::StripeEven
-        } else {
-            ColorId::StripeOdd
-        };
-        mutt_curses_set_color_by_id(ctx, out, color)?;
+    let visible_rows = tree.get(content).state.rect.size.rows.max(0) as usize;
+    let Some(WindowWidget::HelpDialog(data)) = tree.get_mut(content).widget_mut() else {
+        return false;
+    };
 
-        let line = lines
-            .get(row as usize)
-            .cloned()
-            .unwrap_or_else(|| " ".repeat(width));
-        out.execute(Print(line))?;
+    let max_offset = ScrollState::max_offset(data.formatted.len(), visible_rows);
+    match action {
+        Action::NextEntry | Action::NextLine => {
+            data.scroll.scroll_down(1, max_offset);
+        }
+        Action::PrevEntry | Action::PrevLine => {
+            data.scroll.scroll_up(1);
+        }
+        Action::NextPage | Action::HalfDown => {
+            let amount = visible_rows.max(1) / 2;
+            data.scroll.scroll_down(amount, max_offset);
+        }
+        Action::PrevPage | Action::HalfUp => {
+            let amount = visible_rows.max(1) / 2;
+            data.scroll.scroll_up(amount);
+        }
+        Action::FirstEntry | Action::TopPage => {
+            data.scroll.scroll_to_top();
+        }
+        Action::LastEntry | Action::BottomPage => {
+            data.scroll
+                .scroll_to_bottom(visible_rows, data.formatted.len());
+        }
+        _ => return false,
     }
-    Ok(())
+
+    tree.get_mut(content).mark_repaint();
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::WindowActionFlags;
 
     #[test]
     fn help_dialog_content_new() {
@@ -212,30 +270,34 @@ mod tests {
     #[test]
     fn help_dialog_new_builds_tree() {
         let data = HelpData::from_items(vec![HelpItem::new("q", "Quit")]);
-        let dialog = HelpDialog::new(&data);
-        let win = dialog.window();
-        let borrowed = win.borrow();
-        assert_eq!(borrowed.window_type, WindowType::DlgHelp);
-        assert_eq!(borrowed.children.len(), 2);
-        assert!(borrowed
+        let mut tree = WindowTree::new();
+        let dialog = HelpDialog::new(&mut tree, &data);
+        let win = dialog.window_id();
+        assert_eq!(tree.get(win).window_type, WindowType::DlgHelp);
+        assert_eq!(tree.get(win).children.len(), 2);
+        assert!(tree
+            .get(win)
             .help_data
             .as_ref()
             .map(|help| !help.items.is_empty())
             .unwrap_or(false));
-        assert!(borrowed
+        assert!(tree
+            .get(win)
             .children
             .iter()
-            .any(|child| child.borrow().window_type == WindowType::Custom));
-        assert!(borrowed
+            .any(|child| tree.get(*child).window_type == WindowType::Custom));
+        assert!(tree
+            .get(win)
             .children
             .iter()
-            .any(|child| child.borrow().window_type == WindowType::StatusBar));
+            .any(|child| tree.get(*child).window_type == WindowType::StatusBar));
     }
 
     #[test]
     fn help_dialog_recalc_requests_repaint() {
         let items = vec![HelpItem::new("q", "Quit")];
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Custom,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
@@ -243,19 +305,30 @@ mod tests {
             1,
         );
         {
-            let mut borrowed = win.borrow_mut();
-            borrowed.wdata = Some(Box::new(HelpDialogContentData::new(items)));
-            borrowed.actions = WindowActionFlags::NONE;
+            let borrowed = tree.get_mut(win);
+            borrowed.set_widget(WindowWidget::HelpDialog(HelpDialogContentData::new(items)));
+            borrowed.actions = WindowActionFlags::RECALC;
+            borrowed.state.visible = true;
         }
-        let mut borrowed = win.borrow_mut();
-        help_dialog_recalc(&mut borrowed);
-        assert!(borrowed.actions.contains(WindowActionFlags::REPAINT));
+        let mut ctx = GuiContext::new();
+        let mut out = Vec::new();
+        // Use redraw to trigger recalc through the widget path.
+        tree.redraw(win, &mut ctx, &mut out).unwrap();
+        // After recalc, REPAINT should have been added but then consumed by the draw
+        // We verify the widget was formatted instead
+        let data = if let Some(WindowWidget::HelpDialog(data)) = tree.get(win).widget_ref() {
+            data
+        } else {
+            panic!("expected help dialog widget data")
+        };
+        assert_eq!(data.last_width, 10);
     }
 
     #[test]
     fn help_dialog_draw_formats_lines() {
         let items = vec![HelpItem::new("q", "Quit"), HelpItem::new("x", "Exit")];
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Custom,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
@@ -263,22 +336,121 @@ mod tests {
             2,
         );
         {
-            let mut borrowed = win.borrow_mut();
-            borrowed.wdata = Some(Box::new(HelpDialogContentData::new(items)));
-            borrowed.state.cols = 12;
-            borrowed.state.rows = 2;
+            let borrowed = tree.get_mut(win);
+            borrowed.set_widget(WindowWidget::HelpDialog(HelpDialogContentData::new(items)));
+            borrowed.state.rect.size.cols = 12;
+            borrowed.state.rect.size.rows = 2;
+            borrowed.state.visible = true;
+            borrowed.mark_recalc_repaint();
         }
 
         let mut ctx = GuiContext::new();
         let mut out = Vec::new();
-        let mut borrowed = win.borrow_mut();
-        help_dialog_draw(&mut borrowed, &mut ctx, &mut out).unwrap();
+        // Use redraw to trigger recalc and draw through the widget path.
+        tree.redraw(win, &mut ctx, &mut out).unwrap();
 
-        let data = borrowed.wdata_ref::<HelpDialogContentData>().unwrap();
+        let data = if let Some(WindowWidget::HelpDialog(data)) = tree.get(win).widget_ref() {
+            data
+        } else {
+            panic!("expected help dialog widget data")
+        };
         assert_eq!(data.formatted.len(), 2);
         assert_eq!(data.formatted[0].len(), 12);
         assert_eq!(data.formatted[1].len(), 12);
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Quit"));
+    }
+
+    #[test]
+    fn scroll_down_and_up() {
+        let mut data = HelpDialogContentData::new(vec![
+            HelpItem::new("a", "A"),
+            HelpItem::new("b", "B"),
+            HelpItem::new("c", "C"),
+            HelpItem::new("d", "D"),
+            HelpItem::new("e", "E"),
+        ]);
+        data.ensure_formatted(20);
+
+        let visible_rows = 3usize;
+        let max_offset = ScrollState::max_offset(data.formatted.len(), visible_rows);
+
+        assert_eq!(data.scroll.offset(), 0);
+
+        // Scroll down by 1 with 3 visible rows
+        data.scroll.scroll_down(1, max_offset);
+        assert_eq!(data.scroll.offset(), 1);
+
+        // Scroll down more
+        data.scroll.scroll_down(1, max_offset);
+        assert_eq!(data.scroll.offset(), 2);
+
+        // Can't scroll past max (5 items - 3 visible = max offset 2)
+        data.scroll.scroll_down(10, max_offset);
+        assert_eq!(data.scroll.offset(), 2);
+
+        // Scroll up
+        data.scroll.scroll_up(1);
+        assert_eq!(data.scroll.offset(), 1);
+
+        // Scroll up past 0
+        data.scroll.scroll_up(10);
+        assert_eq!(data.scroll.offset(), 0);
+    }
+
+    #[test]
+    fn help_dialog_scroll_handles_actions() {
+        let items: Vec<HelpItem> = (0..20)
+            .map(|i| HelpItem::new(format!("{}", i), format!("Item {}", i)))
+            .collect();
+        let data = HelpData::from_items(items);
+        let mut tree = WindowTree::new();
+        let dialog = HelpDialog::new(&mut tree, &data);
+
+        // Set content window size
+        {
+            let content = tree
+                .get(dialog.window_id())
+                .children
+                .iter()
+                .copied()
+                .find(|c| tree.get(*c).window_type == WindowType::Custom)
+                .unwrap();
+            let content_borrowed = tree.get_mut(content);
+            content_borrowed.state.rect.size.rows = 5;
+            content_borrowed.state.rect.size.cols = 20;
+            if let Some(WindowWidget::HelpDialog(d)) = content_borrowed.widget_mut() {
+                d.ensure_formatted(20);
+            }
+        }
+
+        // Scroll down
+        assert!(help_dialog_scroll(
+            &mut tree,
+            dialog.window_id(),
+            Action::NextEntry
+        ));
+
+        // Verify scroll happened
+        {
+            let content = tree
+                .get(dialog.window_id())
+                .children
+                .iter()
+                .copied()
+                .find(|c| tree.get(*c).window_type == WindowType::Custom)
+                .unwrap();
+            let content_borrowed = tree.get(content);
+            let d = if let Some(WindowWidget::HelpDialog(d)) = content_borrowed.widget_ref() {
+                d
+            } else {
+                panic!("expected help dialog widget data")
+            };
+            assert_eq!(d.scroll.offset(), 1);
+        }
+
+        // Non-help dialog returns false
+        let non_help = tree.add_dialog(WindowType::DlgIndex);
+        assert!(!help_dialog_scroll(&mut tree, non_help, Action::NextEntry));
     }
 }

@@ -1,12 +1,12 @@
 //! Command line parser and executor.
 
-use crate::OpCode;
+use crate::Action;
 
 /// Result of parsing a command.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommandAction {
     /// Execute an opcode.
-    Op(OpCode),
+    Op(Action),
     /// Set a configuration option.
     Set(String, String),
     /// Unknown command.
@@ -23,8 +23,8 @@ pub fn parse_command(cmd: &str) -> CommandAction {
     }
 
     match parts[0] {
-        "q" | "quit" => CommandAction::Op(OpCode::Quit),
-        "h" | "help" | "?" => CommandAction::Op(OpCode::Help),
+        "q" | "quit" => CommandAction::Op(Action::Quit),
+        "h" | "help" | "?" => CommandAction::Op(Action::Help),
         "set" => {
             if parts.len() < 2 {
                 return CommandAction::Unknown("set requires an argument".to_string());
@@ -56,8 +56,8 @@ mod tests {
 
     #[test]
     fn parse_quit() {
-        assert_eq!(parse_command("quit"), CommandAction::Op(OpCode::Quit));
-        assert_eq!(parse_command("q"), CommandAction::Op(OpCode::Quit));
+        assert_eq!(parse_command("quit"), CommandAction::Op(Action::Quit));
+        assert_eq!(parse_command("q"), CommandAction::Op(Action::Quit));
     }
 
     #[test]

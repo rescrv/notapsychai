@@ -1,14 +1,14 @@
 //! Window observer and notification support.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::rc::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 
-use super::MuttWindow;
+use super::Window;
+use super::WindowId;
+use super::WindowTree;
+use super::WindowWidget;
 
 bitflags! {
     /// Window notification flags (for observers).
@@ -47,10 +47,10 @@ pub enum NotifyWindow {
 }
 
 /// Event data for window notifications.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EventWindow {
-    /// Weak reference to the window.
-    pub win: Weak<RefCell<MuttWindow>>,
+    /// Window ID.
+    pub win: WindowId,
     /// Notification flags.
     pub flags: WindowNotifyFlags,
 }
@@ -59,7 +59,7 @@ pub struct EventWindow {
 static NEXT_OBSERVER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Type alias for window observer callbacks.
-pub type WindowObserverFn = fn(NotifyWindow, &EventWindow);
+pub type WindowObserverFn = fn(NotifyWindow, &EventWindow, &mut WindowTree);
 
 /// Trait for window data that tracks its own observer ID.
 ///
@@ -72,20 +72,37 @@ pub trait HasObserverId {
 
 /// Handles the common Delete notification cleanup for window observers.
 ///
-/// Extracts the observer ID from typed window data and removes the observer.
+/// Extracts the observer ID from typed widget data and removes the observer.
 /// Returns true if an observer was found and removed.
-pub fn handle_observer_delete<T: HasObserverId + 'static>(win: &Rc<RefCell<MuttWindow>>) -> bool {
+pub fn handle_observer_delete(tree: &mut WindowTree, win: WindowId) -> bool {
     let observer_id = {
-        let mut borrowed = win.borrow_mut();
-        borrowed
-            .wdata_mut::<T>()
-            .and_then(|data| data.take_observer_id())
+        let win_ref = tree.get_mut(win);
+        win_ref
+            .widget_mut()
+            .and_then(WindowWidget::take_observer_id)
     };
     if let Some(id) = observer_id {
-        win.borrow_mut().remove_observer(id);
+        tree.get_mut(win).remove_observer(id);
         return true;
     }
     false
+}
+
+/// Standard observer that sets RECALC on State notification.
+pub fn standard_observer_recalc(
+    notify_type: NotifyWindow,
+    event: &EventWindow,
+    tree: &mut WindowTree,
+) {
+    match notify_type {
+        NotifyWindow::State => {
+            tree.get_mut(event.win).mark_recalc();
+        }
+        NotifyWindow::Delete => {
+            handle_observer_delete(tree, event.win);
+        }
+        _ => {}
+    }
 }
 
 /// A registered observer for window events.
@@ -115,7 +132,7 @@ impl WindowObserver {
     }
 }
 
-impl MuttWindow {
+impl Window {
     /// Computes the notification flags by comparing old and current state.
     pub fn compute_notify_flags(&self) -> WindowNotifyFlags {
         self.compute_notify_flags_with_visibility(self.old.visible, self.state.visible)
@@ -128,20 +145,20 @@ impl MuttWindow {
     ) -> WindowNotifyFlags {
         let mut flags = WindowNotifyFlags::empty();
 
-        if self.state.rows > self.old.rows {
+        if self.state.rect.size.rows > self.old.rect.size.rows {
             flags |= WindowNotifyFlags::TALLER;
-        } else if self.state.rows < self.old.rows {
+        } else if self.state.rect.size.rows < self.old.rect.size.rows {
             flags |= WindowNotifyFlags::SHORTER;
         }
 
-        if self.state.cols > self.old.cols {
+        if self.state.rect.size.cols > self.old.rect.size.cols {
             flags |= WindowNotifyFlags::WIDER;
-        } else if self.state.cols < self.old.cols {
+        } else if self.state.rect.size.cols < self.old.rect.size.cols {
             flags |= WindowNotifyFlags::NARROWER;
         }
 
-        if self.state.row_offset != self.old.row_offset
-            || self.state.col_offset != self.old.col_offset
+        if self.state.rect.origin.row != self.old.rect.origin.row
+            || self.state.rect.origin.col != self.old.rect.origin.col
         {
             flags |= WindowNotifyFlags::MOVED;
         }
@@ -176,48 +193,23 @@ impl MuttWindow {
             false
         }
     }
+}
 
-    /// Notifies all observers of an event.
-    pub fn notify(&self, notify_type: NotifyWindow, win_weak: Weak<RefCell<MuttWindow>>) {
-        let flags = self.compute_notify_flags();
-        self.notify_with_flags(notify_type, win_weak, flags);
-    }
-
+impl WindowTree {
     /// Notifies all observers of an event with explicit flags.
     pub fn notify_with_flags(
-        &self,
-        notify_type: NotifyWindow,
-        win_weak: Weak<RefCell<MuttWindow>>,
-        flags: WindowNotifyFlags,
-    ) {
-        let event = EventWindow {
-            win: win_weak,
-            flags,
-        };
-        for observer in &self.observers {
-            (observer.callback)(notify_type, &event);
-        }
-    }
-
-    /// Notifies all observers without holding a RefCell borrow during callbacks.
-    pub fn notify_with_flags_rc(
-        win: &Rc<RefCell<MuttWindow>>,
+        &mut self,
+        win: WindowId,
         notify_type: NotifyWindow,
         flags: WindowNotifyFlags,
     ) {
-        let (observers, win_weak) = {
-            let borrowed = win.borrow();
-            (borrowed.observers.clone(), Rc::downgrade(win))
-        };
+        let observers = self.get(win).observers.clone();
         if observers.is_empty() {
             return;
         }
-        let event = EventWindow {
-            win: win_weak,
-            flags,
-        };
+        let event = EventWindow { win, flags };
         for observer in observers {
-            (observer.callback)(notify_type, &event);
+            (observer.callback)(notify_type, &event, self);
         }
     }
 
@@ -225,40 +217,39 @@ impl MuttWindow {
     ///
     /// This emits visibility/size/move change notifications after reflow.
     /// Only windows whose state differs from their old state get notified.
-    pub fn notify_all(win: &Rc<RefCell<Self>>) {
+    pub fn notify_all(&mut self, win: WindowId) {
         let (flags, children) = {
-            let borrowed = win.borrow();
-            let was_visible = borrowed.was_visible();
-            let is_visible = borrowed.is_visible();
-            let flags = borrowed.compute_notify_flags_with_visibility(was_visible, is_visible);
-            (flags, borrowed.children.to_vec())
+            let win_ref = self.get(win);
+            let was_visible = self.was_visible(win);
+            let is_visible = self.is_visible(win);
+            let flags = win_ref.compute_notify_flags_with_visibility(was_visible, is_visible);
+            (flags, win_ref.children.clone())
         };
 
         if !flags.is_empty() {
-            Self::notify_with_flags_rc(win, NotifyWindow::State, flags);
+            self.notify_with_flags(win, NotifyWindow::State, flags);
         }
 
         for child in children {
-            Self::notify_all(&child);
+            self.notify_all(child);
         }
 
-        // Update old state after notifications (matching NeoMutt's visibility rules)
-        let state = win.borrow().state;
-        win.borrow_mut().old = state;
+        let state = self.get(win).state;
+        self.get_mut(win).old = state;
     }
 
     /// Updates old state to match current state for this window and all descendants.
     ///
     /// Call this after notifications to reset the tracking state.
-    pub fn update_old_state(win: &Rc<RefCell<Self>>) {
+    pub fn update_old_state(&mut self, win: WindowId) {
         {
-            let mut borrowed = win.borrow_mut();
-            borrowed.old = borrowed.state;
+            let win_ref = self.get_mut(win);
+            win_ref.old = win_ref.state;
         }
 
-        let borrowed = win.borrow();
-        for child in &borrowed.children {
-            Self::update_old_state(child);
+        let children = self.get(win).children.clone();
+        for child in children {
+            self.update_old_state(child);
         }
     }
 }
@@ -268,85 +259,83 @@ mod tests {
     use super::*;
     use std::cell::RefCell as StdRefCell;
 
-    use crate::window::MuttWindow;
     use crate::window::WindowOrientation;
     use crate::window::WindowSize;
     use crate::window::WindowType;
 
     thread_local! {
-        static OBSERVED: StdRefCell<Vec<(NotifyWindow, WindowNotifyFlags, usize)>> = const { StdRefCell::new(Vec::new()) };
+        static OBSERVED: StdRefCell<Vec<(NotifyWindow, WindowNotifyFlags, WindowId)>> = const { StdRefCell::new(Vec::new()) };
         static ORDER: StdRefCell<Vec<&'static str>> = const { StdRefCell::new(Vec::new()) };
         static REMOVE_ID: StdRefCell<Option<u64>> = const { StdRefCell::new(None) };
     }
 
-    fn record_observer(notify_type: NotifyWindow, event: &EventWindow) {
-        let addr = event
-            .win
-            .upgrade()
-            .map(|w| Rc::as_ptr(&w) as usize)
-            .unwrap_or_default();
+    fn record_observer(notify_type: NotifyWindow, event: &EventWindow, _tree: &mut WindowTree) {
         OBSERVED.with(|observed| {
-            observed.borrow_mut().push((notify_type, event.flags, addr));
+            observed
+                .borrow_mut()
+                .push((notify_type, event.flags, event.win));
         });
     }
 
-    fn observer_a(_notify_type: NotifyWindow, _event: &EventWindow) {
+    fn observer_a(_notify_type: NotifyWindow, _event: &EventWindow, _tree: &mut WindowTree) {
         ORDER.with(|order| order.borrow_mut().push("a"));
     }
 
-    fn observer_b(_notify_type: NotifyWindow, _event: &EventWindow) {
+    fn observer_b(_notify_type: NotifyWindow, _event: &EventWindow, _tree: &mut WindowTree) {
         ORDER.with(|order| order.borrow_mut().push("b"));
     }
 
-    fn observer_remove_self(_notify_type: NotifyWindow, event: &EventWindow) {
-        if let Some(win) = event.win.upgrade() {
-            let id = REMOVE_ID.with(|remove_id| remove_id.borrow_mut().take());
-            if let Some(id) = id {
-                win.borrow_mut().remove_observer(id);
-            }
+    fn observer_remove_self(
+        _notify_type: NotifyWindow,
+        event: &EventWindow,
+        tree: &mut WindowTree,
+    ) {
+        let id = REMOVE_ID.with(|remove_id| remove_id.borrow_mut().take());
+        if let Some(id) = id {
+            tree.get_mut(event.win).remove_observer(id);
         }
     }
 
-    fn observer_add_child(_notify_type: NotifyWindow, event: &EventWindow) {
-        if let Some(win) = event.win.upgrade() {
-            let child = MuttWindow::new(
-                WindowType::Container,
-                WindowOrientation::Vertical,
-                WindowSize::Fixed,
-                1,
-                1,
-            );
-            MuttWindow::add_child(&win, child);
-        }
+    fn observer_add_child(_notify_type: NotifyWindow, event: &EventWindow, tree: &mut WindowTree) {
+        let child = tree.add_window(
+            WindowType::Container,
+            WindowOrientation::Vertical,
+            WindowSize::Fixed,
+            1,
+            1,
+        );
+        tree.add_child(event.win, child);
     }
 
     #[test]
     fn window_notify_flags() {
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        win.borrow_mut().old = super::super::WindowState::new(80, 24);
-        win.borrow_mut().state = super::super::WindowState::new(100, 30);
+        tree.get_mut(win).old = super::super::WindowState::new(crate::geom::Size::new(80, 24));
+        tree.get_mut(win).state = super::super::WindowState::new(crate::geom::Size::new(100, 30));
 
-        let flags = win.borrow().compute_notify_flags();
+        let flags = tree.get(win).compute_notify_flags();
         assert!(flags.contains(WindowNotifyFlags::TALLER));
         assert!(flags.contains(WindowNotifyFlags::WIDER));
     }
 
     #[test]
     fn window_notify_flags_with_ancestor_visibility() {
-        let root = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let root = tree.add_window(
             WindowType::Root,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             80,
             24,
         );
-        let child = MuttWindow::new(
+        let child = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
@@ -354,25 +343,25 @@ mod tests {
             5,
         );
 
-        MuttWindow::add_child(&root, Rc::clone(&child));
+        tree.add_child(root, child);
         {
-            let mut root_mut = root.borrow_mut();
-            root_mut.state = super::super::WindowState::new(80, 24);
-            root_mut.old = super::super::WindowState::new(80, 24);
+            let root_mut = tree.get_mut(root);
+            root_mut.state = super::super::WindowState::new(crate::geom::Size::new(80, 24));
+            root_mut.old = super::super::WindowState::new(crate::geom::Size::new(80, 24));
         }
         {
-            let mut child_mut = child.borrow_mut();
-            child_mut.state = super::super::WindowState::new(10, 5);
-            child_mut.old = super::super::WindowState::new(10, 5);
+            let child_mut = tree.get_mut(child);
+            child_mut.state = super::super::WindowState::new(crate::geom::Size::new(10, 5));
+            child_mut.old = super::super::WindowState::new(crate::geom::Size::new(10, 5));
             child_mut.state.visible = false;
-            child_mut.state.rows = 6;
-            child_mut.state.col_offset = 1;
+            child_mut.state.rect.size.rows = 6;
+            child_mut.state.rect.origin.col = 1;
         }
 
-        child.borrow_mut().add_observer(record_observer);
+        tree.get_mut(child).add_observer(record_observer);
         OBSERVED.with(|observed| observed.borrow_mut().clear());
 
-        MuttWindow::notify_all(&root);
+        tree.notify_all(root);
 
         OBSERVED.with(|observed| {
             let observed = observed.borrow();
@@ -387,84 +376,95 @@ mod tests {
 
     #[test]
     fn add_observer_returns_unique_ids() {
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        let id1 = win.borrow_mut().add_observer(record_observer);
-        let id2 = win.borrow_mut().add_observer(record_observer);
+        let id1 = tree.get_mut(win).add_observer(record_observer);
+        let id2 = tree.get_mut(win).add_observer(record_observer);
         assert_ne!(id1, id2);
     }
 
     #[test]
     fn remove_observer_nonexistent_returns_false() {
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        assert!(!win.borrow_mut().remove_observer(9999));
+        assert!(!tree.get_mut(win).remove_observer(9999));
     }
 
     #[test]
-    fn notify_with_flags_rc_empty_observers() {
-        let win = MuttWindow::new(
+    fn notify_with_flags_empty_observers() {
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        MuttWindow::notify_with_flags_rc(&win, NotifyWindow::State, WindowNotifyFlags::empty());
+        tree.notify_with_flags(win, NotifyWindow::State, WindowNotifyFlags::empty());
     }
 
     #[test]
     fn update_old_state_propagates() {
-        let root = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let root = tree.add_window(
             WindowType::Root,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        let child = MuttWindow::new(
+        let child = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             5,
             5,
         );
-        MuttWindow::add_child(&root, Rc::clone(&child));
+        tree.add_child(root, child);
 
-        root.borrow_mut().state.rows = 12;
-        child.borrow_mut().state.cols = 6;
+        tree.get_mut(root).state.rect.size.rows = 12;
+        tree.get_mut(child).state.rect.size.cols = 6;
 
-        MuttWindow::update_old_state(&root);
+        tree.update_old_state(root);
 
-        let root_borrowed = root.borrow();
-        let child_borrowed = child.borrow();
-        assert_eq!(root_borrowed.old.rows, root_borrowed.state.rows);
-        assert_eq!(child_borrowed.old.cols, child_borrowed.state.cols);
+        let root_borrowed = tree.get(root);
+        let child_borrowed = tree.get(child);
+        assert_eq!(
+            root_borrowed.old.rect.size.rows,
+            root_borrowed.state.rect.size.rows
+        );
+        assert_eq!(
+            child_borrowed.old.rect.size.cols,
+            child_borrowed.state.rect.size.cols
+        );
     }
 
     #[test]
-    fn notify_with_flags_rc_observer_order() {
-        let win = MuttWindow::new(
+    fn notify_with_flags_observer_order() {
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        win.borrow_mut().add_observer(observer_a);
-        win.borrow_mut().add_observer(observer_b);
+        tree.get_mut(win).add_observer(observer_a);
+        tree.get_mut(win).add_observer(observer_b);
         ORDER.with(|order| order.borrow_mut().clear());
-        MuttWindow::notify_with_flags_rc(&win, NotifyWindow::State, WindowNotifyFlags::empty());
+        tree.notify_with_flags(win, NotifyWindow::State, WindowNotifyFlags::empty());
 
         ORDER.with(|order| {
             let order = order.borrow();
@@ -474,22 +474,23 @@ mod tests {
 
     #[test]
     fn observer_removal_during_notify() {
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        let id = win.borrow_mut().add_observer(observer_remove_self);
+        let id = tree.get_mut(win).add_observer(observer_remove_self);
         REMOVE_ID.with(|remove_id| *remove_id.borrow_mut() = Some(id));
-        win.borrow_mut().add_observer(observer_b);
+        tree.get_mut(win).add_observer(observer_b);
 
         ORDER.with(|order| order.borrow_mut().clear());
-        MuttWindow::notify_with_flags_rc(&win, NotifyWindow::State, WindowNotifyFlags::empty());
+        tree.notify_with_flags(win, NotifyWindow::State, WindowNotifyFlags::empty());
 
         ORDER.with(|order| order.borrow_mut().clear());
-        MuttWindow::notify_with_flags_rc(&win, NotifyWindow::State, WindowNotifyFlags::empty());
+        tree.notify_with_flags(win, NotifyWindow::State, WindowNotifyFlags::empty());
         ORDER.with(|order| {
             let order = order.borrow();
             assert_eq!(&order[..], ["b"]);
@@ -498,30 +499,32 @@ mod tests {
 
     #[test]
     fn observer_modifies_window_tree() {
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        win.borrow_mut().add_observer(observer_add_child);
-        let initial = win.borrow().children.len();
-        MuttWindow::notify_with_flags_rc(&win, NotifyWindow::State, WindowNotifyFlags::empty());
-        assert_eq!(win.borrow().children.len(), initial + 1);
+        tree.get_mut(win).add_observer(observer_add_child);
+        let initial = tree.get(win).children.len();
+        tree.notify_with_flags(win, NotifyWindow::State, WindowNotifyFlags::empty());
+        assert_eq!(tree.get(win).children.len(), initial + 1);
     }
 
     #[test]
     fn notify_all_with_no_observers() {
-        let win = MuttWindow::new(
+        let mut tree = WindowTree::new();
+        let win = tree.add_window(
             WindowType::Container,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
             10,
             10,
         );
-        win.borrow_mut().state.rows = 12;
-        MuttWindow::notify_all(&win);
-        assert_eq!(win.borrow().old.rows, 12);
+        tree.get_mut(win).state.rect.size.rows = 12;
+        tree.notify_all(win);
+        assert_eq!(tree.get(win).old.rect.size.rows, 12);
     }
 }

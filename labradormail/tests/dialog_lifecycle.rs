@@ -1,83 +1,96 @@
-use labradormail::simple_color_apply_config;
-use labradormail::window_reflow;
-use labradormail::AllDialogsWindow;
-use labradormail::ColorConfigEntry;
-use labradormail::ColorId;
-use labradormail::Dialog;
-use labradormail::GuiContext;
-use labradormail::HelpBar;
-use labradormail::HelpData;
-use labradormail::HelpItem;
-use labradormail::MuttWindow;
-use labradormail::RootWindow;
-use labradormail::StatusBar;
-use labradormail::WindowActionFlags;
-use labradormail::WindowOrientation;
-use labradormail::WindowSize;
-use labradormail::WindowType;
+use labradormail::prelude::*;
+
+#[test]
+fn agent_dialog_can_be_opened_via_op_agent() {
+    let mut root_win = RootWindow::new_with_size((80, 24)).unwrap();
+    let all_dialogs = root_win.all_dialogs_id();
+
+    // Initially just main_layout in the stack
+    let initial_count = root_win.tree().get(all_dialogs).children.len();
+    assert_eq!(initial_count, 1);
+
+    // Create and push an agent dialog
+    let dialog = AgentDialog::new(root_win.tree_mut());
+    root_win
+        .tree_mut()
+        .stack_push(all_dialogs, dialog.window_id());
+    root_win.tree_mut().set_focus(dialog.window_id());
+
+    // Now should have 2 dialogs in stack
+    let new_count = root_win.tree().get(all_dialogs).children.len();
+    assert_eq!(new_count, 2);
+
+    // Top should be agent dialog
+    let top = root_win.tree().stack_top(all_dialogs).unwrap();
+    assert_eq!(root_win.tree().get(top).window_type, WindowType::DlgAgent);
+}
 
 #[test]
 fn dialog_stack_three_deep_lifecycle() {
-    let all_dialogs = AllDialogsWindow::new();
+    let mut tree = WindowTree::new();
+    let all_dialogs = tree.add_window(
+        WindowType::AllDialogs,
+        WindowOrientation::Vertical,
+        WindowSize::Maximise,
+        0,
+        0,
+    );
 
-    let dialog1 = Dialog::new(WindowType::DlgIndex);
-    let dialog2 = Dialog::new(WindowType::DlgHelp);
-    let dialog3 = Dialog::new(WindowType::DlgCompose);
+    let dialog1 = tree.add_dialog(WindowType::DlgIndex);
+    let dialog2 = tree.add_dialog(WindowType::DlgHelp);
+    let dialog3 = tree.add_dialog(WindowType::DlgIndex);
 
-    all_dialogs.push(dialog1.window().clone());
-    all_dialogs.push(dialog2.window().clone());
-    all_dialogs.push(dialog3.window().clone());
+    tree.stack_push(all_dialogs, dialog1);
+    tree.stack_push(all_dialogs, dialog2);
+    tree.stack_push(all_dialogs, dialog3);
 
-    assert_eq!(all_dialogs.len(), 3);
-    assert!(dialog3.window().borrow().state.visible);
-    assert!(!dialog1.window().borrow().state.visible);
+    assert_eq!(tree.get(all_dialogs).children.len(), 3);
+    assert!(tree.get(dialog3).state.visible);
+    assert!(!tree.get(dialog1).state.visible);
 
-    let top = all_dialogs.top().unwrap();
-    assert!(MuttWindow::same_window(&top, dialog3.window()));
+    let top = tree.stack_top(all_dialogs).unwrap();
+    assert!(tree.same_window(top, dialog3));
 
-    let popped = all_dialogs.pop();
-    assert!(popped.is_some());
-    assert!(dialog2.window().borrow().state.visible);
-    assert!(!dialog3.window().borrow().state.visible);
+    let popped = tree.stack_pop(all_dialogs);
+    assert_eq!(popped, Some(dialog3));
+    assert!(tree.get(dialog2).state.visible);
+    assert!(!tree.get(dialog3).state.visible);
 }
 
 #[test]
 fn focus_change_updates_help_bar_via_root() {
-    let root_win = RootWindow::new_with_size((80, 24)).unwrap();
-    let all_dialogs = root_win.all_dialogs();
-    let help_bar = root_win.help_bar();
+    let mut root_win = RootWindow::new_with_size((80, 24)).unwrap();
+    let help_bar = root_win.help_bar_id();
 
-    help_bar.borrow_mut().actions = WindowActionFlags::NONE;
+    root_win.tree_mut().get_mut(help_bar).clear_actions();
 
-    let dialog = Dialog::new(WindowType::DlgHelp);
-    MuttWindow::add_child(all_dialogs, dialog.window().clone());
-    MuttWindow::set_focus(dialog.window());
+    let dialog = root_win.tree_mut().add_dialog(WindowType::DlgHelp);
+    root_win.dialog_push(dialog);
+    root_win.tree_mut().set_focus(dialog);
 
-    let actions = help_bar.borrow().actions;
+    let actions = root_win.tree().get(help_bar).action_flags();
     assert!(actions.contains(WindowActionFlags::RECALC));
     assert!(actions.contains(WindowActionFlags::REPAINT));
 }
 
 #[test]
 fn reflow_after_visibility_toggle() {
-    let root = MuttWindow::new(
+    let mut tree = WindowTree::new();
+    let root = tree.add_window(
         WindowType::Root,
         WindowOrientation::Vertical,
         WindowSize::Fixed,
         10,
         10,
     );
-    root.borrow_mut().state.cols = 10;
-    root.borrow_mut().state.rows = 10;
-
-    let child1 = MuttWindow::new(
+    let child1 = tree.add_window(
         WindowType::Container,
         WindowOrientation::Vertical,
         WindowSize::Maximise,
         0,
         0,
     );
-    let child2 = MuttWindow::new(
+    let child2 = tree.add_window(
         WindowType::Container,
         WindowOrientation::Vertical,
         WindowSize::Maximise,
@@ -85,34 +98,35 @@ fn reflow_after_visibility_toggle() {
         0,
     );
 
-    MuttWindow::add_child(&root, child1.clone());
-    MuttWindow::add_child(&root, child2.clone());
+    tree.add_child(root, child1);
+    tree.add_child(root, child2);
 
-    window_reflow(&root);
-    assert_eq!(child1.borrow().state.rows, 5);
+    window_reflow(&mut tree, root);
+    assert_eq!(tree.get(child1).state.rect.size.rows, 5);
 
-    child2.borrow_mut().state.visible = false;
-    window_reflow(&root);
-    assert_eq!(child1.borrow().state.rows, 10);
+    tree.set_visible(child2, false);
+    window_reflow(&mut tree, root);
+    assert_eq!(tree.get(child1).state.rect.size.rows, 10);
 }
 
 #[test]
 fn window_tree_traversal_after_remove() {
-    let root = MuttWindow::new(
+    let mut tree = WindowTree::new();
+    let root = tree.add_window(
         WindowType::Root,
         WindowOrientation::Vertical,
         WindowSize::Fixed,
         80,
         24,
     );
-    let message = MuttWindow::new(
+    let message = tree.add_window(
         WindowType::Message,
         WindowOrientation::Vertical,
         WindowSize::Fixed,
         80,
         1,
     );
-    let container = MuttWindow::new(
+    let container = tree.add_window(
         WindowType::Container,
         WindowOrientation::Vertical,
         WindowSize::Maximise,
@@ -120,36 +134,37 @@ fn window_tree_traversal_after_remove() {
         0,
     );
 
-    MuttWindow::add_child(&root, container.clone());
-    MuttWindow::add_child(&container, message.clone());
+    tree.add_child(root, container);
+    tree.add_child(container, message);
 
-    assert!(MuttWindow::find_child(&root, WindowType::Message).is_some());
+    assert!(tree.find_child(root, WindowType::Message).is_some());
 
-    container.borrow_mut().remove_child(&message);
-    assert!(MuttWindow::find_child(&root, WindowType::Message).is_none());
+    tree.remove_child(container, message);
+    assert!(tree.find_child(root, WindowType::Message).is_none());
 }
 
 #[test]
 fn resize_propagates_through_nested_windows() {
     let mut root_win = RootWindow::new_with_size((80, 24)).unwrap();
-    let all_dialogs = root_win.all_dialogs().clone();
+    let all_dialogs = root_win.all_dialogs_id();
 
-    let dialog = Dialog::new(WindowType::DlgIndex);
-    let content = MuttWindow::new(
+    let dialog = root_win.tree_mut().add_dialog(WindowType::DlgIndex);
+    let content = root_win.tree_mut().add_window(
         WindowType::Container,
         WindowOrientation::Vertical,
         WindowSize::Maximise,
         0,
         0,
     );
-    MuttWindow::add_child(dialog.window(), content.clone());
-    MuttWindow::add_child(&all_dialogs, dialog.window().clone());
+    root_win.tree_mut().add_child(dialog, content);
+    root_win.dialog_push(dialog);
 
     root_win.set_size(100, 30);
 
-    let all_dialogs_rows = all_dialogs.borrow().state.rows;
-    let dialog_rows = dialog.window().borrow().state.rows;
-    let content_rows = content.borrow().state.rows;
+    let tree = root_win.tree();
+    let all_dialogs_rows = tree.get(all_dialogs).state.rect.size.rows;
+    let dialog_rows = tree.get(dialog).state.rect.size.rows;
+    let content_rows = tree.get(content).state.rect.size.rows;
 
     assert_eq!(all_dialogs_rows, dialog_rows);
     assert_eq!(dialog_rows, content_rows);
@@ -158,51 +173,44 @@ fn resize_propagates_through_nested_windows() {
 #[test]
 fn color_config_change_affects_multiple_widgets() {
     let mut ctx = GuiContext::new();
-    simple_color_apply_config(
-        &mut ctx,
-        &[
-            ColorConfigEntry {
-                cid: ColorId::Status,
-                fg: Some(crossterm::style::Color::White),
-                bg: Some(crossterm::style::Color::Blue),
-                attrs: vec![crossterm::style::Attribute::Bold],
-            },
-            ColorConfigEntry {
-                cid: ColorId::Normal,
-                fg: Some(crossterm::style::Color::Grey),
-                bg: None,
-                attrs: Vec::new(),
-            },
-        ],
+    ctx.simple_color_set(
+        ColorId::Status,
+        AttrColor::new(
+            Some(crossterm::style::Color::White),
+            Some(crossterm::style::Color::Blue),
+            &[crossterm::style::Attribute::Bold],
+        ),
+    );
+    ctx.simple_color_set(
+        ColorId::Normal,
+        AttrColor::new(Some(crossterm::style::Color::Grey), None, &[]),
     );
 
-    let root = MuttWindow::new(
+    let mut tree = WindowTree::new();
+    let root = tree.add_window(
         WindowType::Root,
         WindowOrientation::Vertical,
         WindowSize::Fixed,
         20,
         4,
     );
-    root.borrow_mut().state.cols = 20;
-    root.borrow_mut().state.rows = 4;
-
-    let help_bar = HelpBar::new();
-    let status_bar = StatusBar::new();
+    let help_bar = HelpBar::new(&mut tree);
+    let status_bar = StatusBar::new(&mut tree);
 
     let help_data = HelpData::from_items(vec![HelpItem::new("q", "Quit")]);
-    let dialog = Dialog::new(WindowType::DlgIndex);
-    dialog.window().borrow_mut().help_data = Some(std::rc::Rc::new(help_data));
+    let dialog = tree.add_dialog(WindowType::DlgIndex);
+    tree.get_mut(dialog).help_data = Some(help_data);
 
-    MuttWindow::add_child(&root, help_bar.window().clone());
-    MuttWindow::add_child(&root, dialog.window().clone());
-    MuttWindow::add_child(&root, status_bar.window().clone());
+    tree.add_child(root, help_bar.window_id());
+    tree.add_child(root, dialog);
+    tree.add_child(root, status_bar.window_id());
 
-    MuttWindow::set_focus(dialog.window());
-    window_reflow(&root);
+    tree.set_focus(dialog);
+    window_reflow(&mut tree, root);
 
     assert!(ctx.simple_color_get(ColorId::Status).is_set);
     assert!(ctx.simple_color_get(ColorId::Normal).is_set);
 
-    help_bar.window().borrow_mut().actions |= WindowActionFlags::REPAINT;
-    status_bar.window().borrow_mut().actions |= WindowActionFlags::REPAINT;
+    tree.get_mut(help_bar.window_id()).mark_repaint();
+    tree.get_mut(status_bar.window_id()).mark_repaint();
 }

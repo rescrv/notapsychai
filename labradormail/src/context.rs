@@ -4,16 +4,241 @@
 //! runtime state into a single `GuiContext` struct that gets passed through
 //! the call stack.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::rc::Weak;
+use std::io::Result;
+use std::io::Write;
 
 use crossterm::style::Attribute;
+use crossterm::style::Color;
+use crossterm::style::ResetColor;
+use crossterm::style::SetAttribute;
+use crossterm::style::SetBackgroundColor;
+use crossterm::style::SetForegroundColor;
+use crossterm::ExecutableCommand;
 
-use crate::mutt_curses::AttrColor;
-use crate::mutt_curses::ColorId;
 use crate::window::CursorState;
-use crate::window::MuttWindow;
+use crate::window::WindowId;
+
+/// Color IDs that map to palette entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColorId {
+    /// No color.
+    None = 0,
+    /// MIME attachments text (entire line).
+    Attachment,
+    /// MIME attachment text (takes a pattern).
+    AttachHeaders,
+    /// Pager body highlight (takes a pattern).
+    Body,
+    /// Bold text.
+    Bold,
+    /// Header labels, e.g. From:
+    ComposeHeader,
+    /// Compose security both.
+    ComposeSecurityBoth,
+    /// Compose security encrypt.
+    ComposeSecurityEncrypt,
+    /// Compose security none.
+    ComposeSecurityNone,
+    /// Compose security sign.
+    ComposeSecuritySign,
+    /// Error message.
+    Error,
+    /// Header default color.
+    HdrDefault,
+    /// Header patterns.
+    Header,
+    /// Selected item in list.
+    Indicator,
+    /// Italic text.
+    Italic,
+    /// Pager markers.
+    Markers,
+    /// Informational message.
+    Message,
+    /// Plain text.
+    Normal,
+    /// Options in prompt.
+    Options,
+    /// Progress bar.
+    Progress,
+    /// Question/user input.
+    Prompt,
+    /// Quoted text level 0.
+    Quoted0,
+    /// Quoted text level 1.
+    Quoted1,
+    /// Quoted text level 2.
+    Quoted2,
+    /// Quoted text level 3.
+    Quoted3,
+    /// Quoted text level 4.
+    Quoted4,
+    /// Quoted text level 5.
+    Quoted5,
+    /// Quoted text level 6.
+    Quoted6,
+    /// Quoted text level 7.
+    Quoted7,
+    /// Quoted text level 8.
+    Quoted8,
+    /// Quoted text level 9.
+    Quoted9,
+    /// Search matches.
+    Search,
+    /// Sidebar background.
+    SidebarBackground,
+    /// Sidebar divider.
+    SidebarDivider,
+    /// Sidebar flagged.
+    SidebarFlagged,
+    /// Sidebar highlight.
+    SidebarHighlight,
+    /// Sidebar indicator.
+    SidebarIndicator,
+    /// Sidebar new.
+    SidebarNew,
+    /// Sidebar ordinary.
+    SidebarOrdinary,
+    /// Sidebar spool file.
+    SidebarSpoolFile,
+    /// Sidebar unread.
+    SidebarUnread,
+    /// Signature lines.
+    Signature,
+    /// Status bar.
+    Status,
+    /// Help stripes even.
+    StripeEven,
+    /// Help stripes odd.
+    StripeOdd,
+    /// Pager tildes.
+    Tilde,
+    /// Index tree glyphs.
+    Tree,
+    /// Underlined text.
+    Underline,
+    /// Warning messages.
+    Warning,
+    /// Index default (pattern).
+    Index,
+    /// Index author.
+    IndexAuthor,
+    /// Index collapsed.
+    IndexCollapsed,
+    /// Index date.
+    IndexDate,
+    /// Index flags.
+    IndexFlags,
+    /// Index label.
+    IndexLabel,
+    /// Index number.
+    IndexNumber,
+    /// Index size.
+    IndexSize,
+    /// Index subject.
+    IndexSubject,
+    /// Index tag.
+    IndexTag,
+    /// Index tags.
+    IndexTags,
+    /// Sentinel.
+    Max,
+}
+
+/// Color + attribute bundle used by curses-like callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttrColor {
+    /// Foreground color.
+    pub fg: Color,
+    /// Background color.
+    pub bg: Color,
+    /// Foreground explicitly set.
+    pub fg_set: bool,
+    /// Background explicitly set.
+    pub bg_set: bool,
+    /// Attributes to apply.
+    pub attrs: Vec<Attribute>,
+    /// Whether this color entry is configured.
+    pub is_set: bool,
+}
+
+impl AttrColor {
+    /// Creates an unset color entry.
+    pub fn unset() -> Self {
+        Self {
+            fg: Color::Reset,
+            bg: Color::Reset,
+            fg_set: false,
+            bg_set: false,
+            attrs: Vec::new(),
+            is_set: false,
+        }
+    }
+
+    /// Creates a color entry with optional foreground/background and attributes.
+    pub fn new(fg: Option<Color>, bg: Option<Color>, attrs: &[Attribute]) -> Self {
+        let fg_set = fg.is_some();
+        let bg_set = bg.is_some();
+        let is_set = fg_set || bg_set || !attrs.is_empty();
+        Self {
+            fg: fg.unwrap_or(Color::Reset),
+            bg: bg.unwrap_or(Color::Reset),
+            fg_set,
+            bg_set,
+            attrs: attrs.to_vec(),
+            is_set,
+        }
+    }
+
+    /// Applies this color and attributes to the terminal.
+    pub fn apply(&self, out: &mut dyn Write) -> Result<()> {
+        out.execute(SetAttribute(Attribute::Reset))?;
+        out.execute(ResetColor)?;
+        if self.fg_set {
+            out.execute(SetForegroundColor(self.fg))?;
+        }
+        if self.bg_set {
+            out.execute(SetBackgroundColor(self.bg))?;
+        }
+        for attr in &self.attrs {
+            out.execute(SetAttribute(*attr))?;
+        }
+        Ok(())
+    }
+
+    /// Merges an overlay color over a base color.
+    pub fn merged_over(base: &AttrColor, overlay: &AttrColor) -> AttrColor {
+        if !overlay.is_set {
+            return base.clone();
+        }
+        if !base.is_set {
+            return overlay.clone();
+        }
+
+        let mut attrs = Vec::new();
+        for attr in base.attrs.iter().chain(overlay.attrs.iter()) {
+            if !attrs.contains(attr) {
+                attrs.push(*attr);
+            }
+        }
+
+        AttrColor {
+            fg: if overlay.fg_set { overlay.fg } else { base.fg },
+            bg: if overlay.bg_set { overlay.bg } else { base.bg },
+            fg_set: overlay.fg_set || base.fg_set,
+            bg_set: overlay.bg_set || base.bg_set,
+            attrs,
+            is_set: overlay.is_set || base.is_set,
+        }
+    }
+}
+
+impl Default for AttrColor {
+    fn default() -> Self {
+        Self::unset()
+    }
+}
 
 /// Storage for the color palette.
 #[derive(Debug)]
@@ -75,8 +300,8 @@ pub struct GuiContext {
     saved_cursor: CursorState,
     /// Current terminal color.
     current_color: AttrColor,
-    /// Weak reference to the root window.
-    root_window: Option<Weak<RefCell<MuttWindow>>>,
+    /// Root window ID.
+    root_window: Option<WindowId>,
 }
 
 impl Default for GuiContext {
@@ -144,13 +369,13 @@ impl GuiContext {
     }
 
     /// Registers the root window.
-    pub fn register_root_window(&mut self, root: &Rc<RefCell<MuttWindow>>) {
-        self.root_window = Some(Rc::downgrade(root));
+    pub fn register_root_window(&mut self, root: WindowId) {
+        self.root_window = Some(root);
     }
 
-    /// Gets a reference to the root window if it exists.
-    pub fn root_window(&self) -> Option<Rc<RefCell<MuttWindow>>> {
-        self.root_window.as_ref().and_then(|weak| weak.upgrade())
+    /// Gets the root window ID if it exists.
+    pub fn root_window(&self) -> Option<WindowId> {
+        self.root_window
     }
 
     /// Clears the root window reference.
@@ -162,6 +387,52 @@ impl GuiContext {
     pub fn merge_with_normal(&self, overlay: &AttrColor) -> AttrColor {
         let normal = self.simple_color_get(ColorId::Normal);
         AttrColor::merged_over(&normal, overlay)
+    }
+
+    /// Sets the color/attribute state for subsequent output.
+    pub fn set_color(&mut self, out: &mut dyn Write, ac: &AttrColor) -> Result<()> {
+        ac.apply(out)?;
+        self.set_current_color(ac.clone());
+        Ok(())
+    }
+
+    /// Sets the color by palette ID (fallbacks to normal if unset).
+    pub fn set_color_by_id(&mut self, out: &mut dyn Write, cid: ColorId) -> Result<AttrColor> {
+        let mut ac = self.simple_color_get(cid);
+        if !ac.is_set {
+            ac = self.simple_color_get(ColorId::Normal);
+        }
+        self.set_color(out, &ac)?;
+        Ok(ac)
+    }
+
+    /// Sets color by palette ID, merged over normal.
+    pub fn set_normal_backed_color_by_id(
+        &mut self,
+        out: &mut dyn Write,
+        cid: ColorId,
+    ) -> Result<AttrColor> {
+        let normal = self.simple_color_get(ColorId::Normal);
+        let overlay = self.simple_color_get(cid);
+        let merged = AttrColor::merged_over(&normal, &overlay);
+        self.set_color(out, &merged)?;
+        Ok(merged)
+    }
+
+    /// Sets the cursor state and returns the previous one.
+    pub fn set_cursor(&mut self, out: &mut dyn Write, state: CursorState) -> Result<CursorState> {
+        let old = self.saved_cursor();
+        self.set_saved_cursor(state);
+
+        if let Err(err) = state.set(out) {
+            if state == CursorState::Visible {
+                let _ = CursorState::VeryVisible.set(out);
+            } else {
+                return Err(err);
+            }
+        }
+
+        Ok(old)
     }
 }
 
@@ -246,17 +517,16 @@ mod tests {
     #[test]
     fn root_window_registration_lifecycle() {
         let mut ctx = GuiContext::new();
-        let root = MuttWindow::new(
+        let mut tree = crate::window::WindowTree::new();
+        let root = tree.add_window(
             crate::window::WindowType::Root,
             crate::window::WindowOrientation::Vertical,
             crate::window::WindowSize::Fixed,
             80,
             24,
         );
-        ctx.register_root_window(&root);
+        ctx.register_root_window(root);
         assert!(ctx.root_window().is_some());
-        drop(root);
-        assert!(ctx.root_window().is_none());
         ctx.clear_root_window();
         assert!(ctx.root_window().is_none());
     }

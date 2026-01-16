@@ -1,8 +1,8 @@
 #[cfg(all(feature = "client", feature = "server"))]
 mod integration {
     use agent_inbox_protocol::{
-        ActionRequest, ActionResponse, Body, Client, From, Mailbox, MailboxName, MailboxProvider,
-        Message, MessageId, QueryParameters, QueryResult, router,
+        router, Body, Client, From, Mailbox, MailboxName, MailboxProvider, Message, MessageID,
+        QueryParameters, QueryResult, ToolCallRequest, ToolCallResponse,
     };
     use chrono::Utc;
     use tokio::net::TcpListener;
@@ -23,8 +23,11 @@ mod integration {
             Ok(self.response.clone())
         }
 
-        async fn action(&mut self, _request: ActionRequest) -> Result<ActionResponse, Self::Error> {
-            Ok(ActionResponse::success())
+        async fn tool_call(
+            &mut self,
+            _request: ToolCallRequest,
+        ) -> Result<ToolCallResponse, Self::Error> {
+            Ok(ToolCallResponse::success())
         }
     }
 
@@ -33,12 +36,12 @@ mod integration {
         let mailbox = Mailbox {
             name: MailboxName::new("inbox").expect("valid mailbox name"),
             messages: vec![Message {
-                msg_id: MessageId::new("integration-1").expect("valid message id"),
+                msg_id: MessageID::new("integration-1").expect("valid message id"),
                 date: Utc::now(),
                 from: From::new("alice@example.com").expect("valid from"),
                 body: Body::new("hello from the integration test").expect("valid body"),
                 wrap: false,
-                actions: Vec::new(),
+                tools: Vec::new(),
             }],
         };
         let expected = QueryResult::new(vec![mailbox]);

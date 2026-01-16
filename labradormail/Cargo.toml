@@ -18,3 +18,5 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 unicode-width = "0.2"
 rc_conf = "0.13.0"
+indicio = "0.12.0"
+biometrics = "0.12.0"

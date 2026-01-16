@@ -2,28 +2,25 @@
 //!
 //! The status bar displays a title at the bottom of dialogs.
 
-use std::cell::RefCell;
 use std::io::Result;
 use std::io::Write;
-use std::rc::Rc;
 
+use crate::context::AttrColor;
+use crate::context::ColorId;
 use crate::context::GuiContext;
-use crate::curs_lib::mutt_paddstr_string;
-use crate::mutt_curses::mutt_curses_merge_with_normal;
-use crate::mutt_curses::mutt_curses_set_color;
-use crate::mutt_curses::mutt_curses_set_color_by_id;
-use crate::mutt_curses::mutt_curses_set_normal_backed_color_by_id;
-use crate::mutt_curses::AttrColor;
-use crate::mutt_curses::ColorId;
-use crate::window::handle_observer_delete;
+use crate::curs_lib::pad_string;
+use crate::render::Renderer;
+use crate::window::CursorBehavior;
 use crate::window::EventWindow;
 use crate::window::HasObserverId;
-use crate::window::MuttWindow;
 use crate::window::NotifyWindow;
-use crate::window::WindowActionFlags;
+use crate::window::RenderMode;
+use crate::window::WindowId;
 use crate::window::WindowOrientation;
 use crate::window::WindowSize;
+use crate::window::WindowTree;
 use crate::window::WindowType;
+use crate::window::WindowWidget;
 
 /// Simple status bar private data.
 #[derive(Debug, Clone, Default)]
@@ -57,9 +54,9 @@ impl SBarPrivateData {
     /// Formats the title to fit within the given width.
     ///
     /// Truncates if too long, pads with spaces if too short.
-    /// This matches NeoMutt's mutt_paddstr behavior.
+    /// This matches NeoMutt's padding behavior.
     pub fn format_to_width(&mut self, width: usize) {
-        self.formatted = mutt_paddstr_string(&self.display, width);
+        self.formatted = pad_string(&self.display, width);
     }
 
     /// Gets the formatted display string.
@@ -79,15 +76,52 @@ impl HasObserverId for SBarPrivateData {
     }
 }
 
+impl SBarPrivateData {
+    pub fn update(&mut self, tree: &mut WindowTree, win: WindowId) {
+        tree.get_mut(win).mark_repaint();
+    }
+
+    pub fn render(
+        &mut self,
+        tree: &mut WindowTree,
+        win: WindowId,
+        ctx: &mut GuiContext,
+        out: &mut dyn Write,
+        mode: RenderMode,
+    ) -> Result<CursorBehavior> {
+        if matches!(mode, RenderMode::CursorOnly) {
+            return Ok(CursorBehavior::Hidden);
+        }
+        let width = tree.get(win).state.rect.size.cols as usize;
+        self.format_to_width(width);
+
+        let color = self.color.clone();
+        let formatted = self.formatted.clone();
+
+        if color.is_set {
+            let merged = ctx.merge_with_normal(&color);
+            ctx.set_color(out, &merged)?;
+        } else {
+            ctx.set_normal_backed_color_by_id(out, ColorId::Status)?;
+        }
+        {
+            let mut renderer = Renderer::new(ctx, out);
+            renderer.draw_single_row_bar(tree.get(win), &formatted)?;
+        }
+        ctx.set_color_by_id(out, ColorId::Normal)?;
+        Ok(CursorBehavior::Hidden)
+    }
+}
+
 /// Status bar window wrapper.
 pub struct StatusBar {
-    window: Rc<RefCell<MuttWindow>>,
+    window: WindowId,
 }
 
 impl StatusBar {
     /// Creates a new status bar.
-    pub fn new() -> Self {
-        let window = MuttWindow::new(
+    pub fn new(tree: &mut WindowTree) -> Self {
+        let window = tree.add_window(
             WindowType::StatusBar,
             WindowOrientation::Vertical,
             WindowSize::Fixed,
@@ -96,16 +130,13 @@ impl StatusBar {
         );
 
         {
-            let mut borrowed = window.borrow_mut();
-            borrowed.wdata = Some(Box::new(SBarPrivateData::new()));
-            borrowed.recalc = Some(sbar_recalc);
-            borrowed.repaint = Some(sbar_repaint);
-            borrowed.draw = Some(sbar_draw);
+            let borrowed = tree.get_mut(window);
+            borrowed.set_widget(WindowWidget::StatusBar(SBarPrivateData::new()));
         }
-        let observer_id = window.borrow_mut().add_observer(sbar_window_observer);
+        let observer_id = tree.get_mut(window).add_observer(status_bar_observer);
         {
-            let mut borrowed = window.borrow_mut();
-            if let Some(data) = borrowed.wdata_mut::<SBarPrivateData>() {
+            let borrowed = tree.get_mut(window);
+            if let Some(WindowWidget::StatusBar(data)) = borrowed.widget_mut() {
                 data.window_observer_id = Some(observer_id);
             }
         }
@@ -114,108 +145,65 @@ impl StatusBar {
     }
 
     /// Returns a reference to the underlying window.
-    pub fn window(&self) -> &Rc<RefCell<MuttWindow>> {
-        &self.window
+    pub fn window_id(&self) -> WindowId {
+        self.window
     }
 
     /// Sets the status bar title.
-    pub fn set_title(&self, title: &str) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<SBarPrivateData>() {
+    pub fn set_title(&self, tree: &mut WindowTree, title: &str) {
+        let borrowed = tree.get_mut(self.window);
+        if let Some(WindowWidget::StatusBar(data)) = borrowed.widget_mut() {
             data.set_title(title);
         }
-        borrowed.actions |= WindowActionFlags::RECALC | WindowActionFlags::REPAINT;
+        borrowed.mark_recalc_repaint();
     }
 
     /// Sets status bar color and triggers repaint.
-    pub fn set_color(&self, color: AttrColor) {
-        let mut borrowed = self.window.borrow_mut();
-        if let Some(data) = borrowed.wdata_mut::<SBarPrivateData>() {
+    pub fn set_color(&self, tree: &mut WindowTree, color: AttrColor) {
+        let borrowed = tree.get_mut(self.window);
+        if let Some(WindowWidget::StatusBar(data)) = borrowed.widget_mut() {
             data.set_color(color);
         }
-        borrowed.actions |= WindowActionFlags::REPAINT;
+        borrowed.mark_repaint();
     }
 
     /// Marks the status bar for repaint after a color configuration change.
-    pub fn notify_color_change(&self) {
-        self.window.borrow_mut().actions |= WindowActionFlags::REPAINT;
+    pub fn notify_color_change(&self, tree: &mut WindowTree) {
+        tree.get_mut(self.window).mark_repaint();
     }
 
     /// Gets the status bar title.
-    pub fn title(&self) -> Option<String> {
-        let borrowed = self.window.borrow();
-        borrowed
-            .wdata_ref::<SBarPrivateData>()
-            .map(|data| data.title().to_string())
+    pub fn title(&self, tree: &WindowTree) -> Option<String> {
+        if let Some(WindowWidget::StatusBar(data)) = tree.get(self.window).widget_ref() {
+            Some(data.title().to_string())
+        } else {
+            None
+        }
     }
 
     /// Gets the formatted display string.
-    pub fn formatted(&self) -> Option<String> {
-        let borrowed = self.window.borrow();
-        borrowed
-            .wdata_ref::<SBarPrivateData>()
-            .map(|data| data.formatted().to_string())
+    pub fn formatted(&self, tree: &WindowTree) -> Option<String> {
+        if let Some(WindowWidget::StatusBar(data)) = tree.get(self.window).widget_ref() {
+            Some(data.formatted().to_string())
+        } else {
+            None
+        }
     }
 }
 
-impl Default for StatusBar {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Recalculate callback for status bar.
-///
-/// Following NeoMutt's pattern: recalc requests repaint.
-fn sbar_recalc(win: &mut MuttWindow) {
-    win.actions |= WindowActionFlags::REPAINT;
-}
-
-/// Repaint callback for status bar.
-///
-/// Formats the title to fit the window width (truncate/pad).
-/// In NeoMutt this draws directly using curses. In our implementation,
-/// we prepare the formatted string for the draw phase.
-fn sbar_repaint(win: &mut MuttWindow) {
-    let width = win.state.cols as usize;
-
-    if let Some(data) = win.wdata_mut::<SBarPrivateData>() {
-        data.format_to_width(width);
-    }
-}
-
-fn sbar_draw(win: &mut MuttWindow, ctx: &mut GuiContext, out: &mut dyn Write) -> Result<()> {
-    let Some(data) = win.wdata_ref::<SBarPrivateData>() else {
-        return Ok(());
-    };
-    let color = data.color.clone();
-    let formatted = data.formatted.clone();
-
-    win.move_cursor(out, 0, 0)?;
-    if color.is_set {
-        let merged = mutt_curses_merge_with_normal(ctx, &color);
-        mutt_curses_set_color(ctx, out, &merged)?;
-    } else {
-        mutt_curses_set_normal_backed_color_by_id(ctx, out, ColorId::Status)?;
-    }
-    win.addstr(out, &formatted)?;
-    mutt_curses_set_color_by_id(ctx, out, ColorId::Normal)?;
-    win.clrtoeol(ctx, out)?;
-    Ok(())
-}
-
-fn sbar_window_observer(notify_type: NotifyWindow, event: &EventWindow) {
-    let win = match event.win.upgrade() {
-        Some(win) => win,
-        None => return,
-    };
-
+fn status_bar_observer(notify_type: NotifyWindow, event: &EventWindow, tree: &mut WindowTree) {
     match notify_type {
         NotifyWindow::State => {
-            win.borrow_mut().actions |= WindowActionFlags::REPAINT;
+            tree.get_mut(event.win).mark_repaint();
         }
         NotifyWindow::Delete => {
-            handle_observer_delete::<SBarPrivateData>(&win);
+            let observer_id = tree
+                .get_mut(event.win)
+                .widget_mut()
+                .and_then(WindowWidget::take_observer_id);
+            if let Some(id) = observer_id {
+                tree.get_mut(event.win).remove_observer(id);
+            }
         }
         _ => {}
     }
@@ -235,17 +223,22 @@ mod tests {
 
     #[test]
     fn status_bar_create() {
-        let sbar = StatusBar::new();
-        assert_eq!(sbar.window().borrow().req_rows, 1);
-        assert_eq!(sbar.window().borrow().window_type, WindowType::StatusBar);
+        let mut tree = WindowTree::new();
+        let sbar = StatusBar::new(&mut tree);
+        assert_eq!(tree.get(sbar.window_id()).req_size.rows, 1);
+        assert_eq!(
+            tree.get(sbar.window_id()).window_type,
+            WindowType::StatusBar
+        );
     }
 
     #[test]
     fn status_bar_set_title() {
-        let sbar = StatusBar::new();
-        sbar.set_title("My Status");
+        let mut tree = WindowTree::new();
+        let sbar = StatusBar::new(&mut tree);
+        sbar.set_title(&mut tree, "My Status");
 
-        let title = sbar.title();
+        let title = sbar.title(&tree);
         assert!(title.is_some());
         assert_eq!(title.unwrap(), "My Status");
     }
@@ -321,39 +314,44 @@ mod tests {
 
     #[test]
     fn sbar_repaint_formats() {
-        let sbar = StatusBar::new();
-        sbar.set_title("Test");
+        let mut tree = WindowTree::new();
+        let sbar = StatusBar::new(&mut tree);
+        sbar.set_title(&mut tree, "Test");
 
         // Simulate window with known width
         {
-            let mut win = sbar.window().borrow_mut();
-            win.state.cols = 10;
+            let win = tree.get_mut(sbar.window_id());
+            win.state.rect.size.cols = 10;
+            win.state.visible = true;
+            win.mark_repaint();
         }
 
-        // Call repaint
-        {
-            let mut win = sbar.window().borrow_mut();
-            sbar_repaint(&mut win);
-        }
+        let mut ctx = GuiContext::new();
+        let mut out = Vec::new();
+        // Use redraw to trigger repaint through the widget path.
+        tree.redraw(sbar.window_id(), &mut ctx, &mut out).unwrap();
 
-        let formatted = sbar.formatted();
+        let formatted = sbar.formatted(&tree);
         assert!(formatted.is_some());
         assert_eq!(formatted.unwrap(), "Test      ");
     }
 
     #[test]
     fn sbar_draw_outputs_title() {
-        let sbar = StatusBar::new();
-        sbar.set_title("Status");
+        let mut tree = WindowTree::new();
+        let sbar = StatusBar::new(&mut tree);
+        sbar.set_title(&mut tree, "Status");
         let mut ctx = GuiContext::new();
         let mut out = Vec::new();
         {
-            let mut win = sbar.window().borrow_mut();
-            win.state.cols = 10;
-            win.state.rows = 1;
-            sbar_repaint(&mut win);
-            sbar_draw(&mut win, &mut ctx, &mut out).unwrap();
+            let win = tree.get_mut(sbar.window_id());
+            win.state.rect.size.cols = 10;
+            win.state.rect.size.rows = 1;
+            win.state.visible = true;
+            win.mark_repaint();
         }
+        // Use redraw to trigger repaint and draw through the widget path.
+        tree.redraw(sbar.window_id(), &mut ctx, &mut out).unwrap();
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Status"));
     }

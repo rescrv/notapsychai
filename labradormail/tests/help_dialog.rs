@@ -1,14 +1,11 @@
-use labradormail::HelpData;
-use labradormail::HelpDialog;
-use labradormail::HelpItem;
-use labradormail::WindowType;
+use labradormail::prelude::*;
 
 #[test]
 fn help_dialog_window_tree() {
+    let mut tree = WindowTree::new();
     let data = HelpData::from_items(vec![HelpItem::new("q", "Quit")]);
-    let dialog = HelpDialog::new(&data);
-    let win = dialog.window();
-    let borrowed = win.borrow();
-    assert_eq!(borrowed.window_type, WindowType::DlgHelp);
-    assert_eq!(borrowed.children.len(), 2);
+    let dialog = HelpDialog::new(&mut tree, &data);
+    let win = tree.get(dialog.window_id());
+    assert_eq!(win.window_type, WindowType::DlgHelp);
+    assert_eq!(win.children.len(), 2);
 }

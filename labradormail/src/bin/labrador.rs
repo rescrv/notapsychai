@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::process;
 
-use labradormail::run_from_servers;
-use labradormail::ServerConfig;
+use labradormail::prelude::run_from_servers;
+use labradormail::prelude::ServerConfig;
 use rc_conf::RcConf;
 use rc_conf::SwitchPosition;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let rc_conf = match RcConf::parse("labrador.conf") {
         Ok(rc) => rc,
         Err(e) => {
@@ -46,7 +47,7 @@ fn main() {
         process::exit(1);
     }
 
-    if let Err(e) = run_from_servers(&configs) {
+    if let Err(e) = run_from_servers(&configs).await {
         eprintln!("Error: {}", e);
         process::exit(1);
     }

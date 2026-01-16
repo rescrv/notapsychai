@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use agent_inbox_protocol::{
-    Action, ActionRequest, ActionResponse, Body, Mailbox, MailboxName, Message, MessageId,
-    QueryParameters, QueryResult, Verb,
+    Body, Mailbox, MailboxName, Message, MessageID, QueryParameters, QueryResult, ToolCallRequest,
+    ToolCallResponse, ToolParam,
 };
 use axum::{
     Router,
@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{TimeZone, Utc};
+use serde::Deserialize;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
@@ -97,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/spoons", get(get_spoons).put(set_spoons))
         .route("/user", get(get_user).put(update_user))
         .route("/inbox/query", post(inbox_query))
-        .route("/inbox/action", post(inbox_action))
+        .route("/inbox/call", post(inbox_call))
         .layer(cors)
         .with_state(state);
 
@@ -556,23 +557,33 @@ async fn inbox_query(
     let mut messages: Vec<Message> = schedule
         .into_iter()
         .map(|(datetime, rhythm_def)| {
-            let msg_id = MessageId::new(format!(
-                "{}:{}",
-                rhythm_def.id.to_string(),
-                datetime.timestamp()
-            ))
-            .unwrap_or_default();
+            let msg_id = MessageID::new(format!("{}:{}", rhythm_def.id, datetime.timestamp()))
+                .unwrap_or_default();
+            let when_schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "when": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Optional ISO-8601 date-time override for the occurrence."
+                    }
+                }
+            });
             Message {
                 msg_id,
                 date: datetime.with_timezone(&Utc),
                 from: from_addr.clone(),
                 body: Body::new(&rhythm_def.description).unwrap_or_default(),
                 wrap: true,
-                actions: vec![
-                    Action::new(Verb::new("done").unwrap_or_default(), "Mark Done")
-                        .with_shortcut("d"),
-                    Action::new(Verb::new("defer").unwrap_or_default(), "Defer")
-                        .with_shortcut("D"),
+                tools: vec![
+                    ToolParam::new("done".to_string(), when_schema.clone()).with_description(
+                        "Mark as done. Uses the message occurrence unless 'when' is provided."
+                            .to_string(),
+                    ),
+                    ToolParam::new("defer".to_string(), when_schema).with_description(
+                        "Defer this occurrence. Uses the message occurrence unless 'when' is provided."
+                            .to_string(),
+                    ),
                 ],
             }
         })
@@ -629,39 +640,48 @@ async fn inbox_query(
     Ok(Json(QueryResult::new(mailboxes)))
 }
 
-async fn inbox_action(
+#[derive(Deserialize)]
+struct ToolWhenInput {
+    #[serde(default)]
+    when: Option<chrono::DateTime<Utc>>,
+}
+
+fn tool_when_from_input(input: &serde_json::Value) -> Result<Option<chrono::DateTime<Utc>>, String> {
+    if input.is_null() {
+        return Ok(None);
+    }
+    let parsed: ToolWhenInput =
+        serde_json::from_value(input.clone()).map_err(|err| format!("Invalid tool input: {err}"))?;
+    Ok(parsed.when)
+}
+
+async fn inbox_call(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<ActionRequest>,
-) -> Result<Json<ActionResponse>, AppError> {
+    Json(request): Json<ToolCallRequest>,
+) -> Result<Json<ToolCallResponse>, AppError> {
     let user_id = extract_user_from_headers(&headers, &state).await?;
 
     let msg_id = request.message_id.as_str();
-    let mut parts = msg_id.split(':');
-    let rhythm_part = match parts.next() {
-        Some(part) => part,
-        None => {
-            return Ok(Json(ActionResponse::failure(
-                "Invalid message ID format",
-            )));
-        }
-    };
+    let mut parts = msg_id.rsplitn(2, ':');
     let timestamp_part = match parts.next() {
-        Some(part) => part,
-        None => {
-            return Ok(Json(ActionResponse::failure(
-                "Invalid message ID format",
-            )));
+        Some(part) if !part.is_empty() => part,
+        _ => {
+            eprintln!("FINDME {}:{} {request:#?}", file!(), line!());
+            return Ok(Json(ToolCallResponse::failure("Invalid message ID format")));
         }
     };
-    if parts.next().is_some() {
-        return Ok(Json(ActionResponse::failure(
-            "Invalid message ID format",
-        )));
-    }
+    let rhythm_part = match parts.next() {
+        Some(part) if !part.is_empty() => part,
+        _ => {
+            eprintln!("FINDME {}:{} {request:#?}", file!(), line!());
+            return Ok(Json(ToolCallResponse::failure("Invalid message ID format")));
+        }
+    };
 
     let Some(rhythm_id) = RhythmID::from_human_readable(rhythm_part) else {
-        return Ok(Json(ActionResponse::failure(
+            eprintln!("FINDME {}:{} {request:#?}", file!(), line!());
+        return Ok(Json(ToolCallResponse::failure(
             "Invalid rhythm ID in message",
         )));
     };
@@ -669,45 +689,52 @@ async fn inbox_action(
     let timestamp = match timestamp_part.parse::<i64>() {
         Ok(value) => value,
         Err(_) => {
-            return Ok(Json(ActionResponse::failure(
+            return Ok(Json(ToolCallResponse::failure(
                 "Invalid timestamp in message",
             )));
         }
     };
     let Some(when) = Utc.timestamp_opt(timestamp, 0).single() else {
-        return Ok(Json(ActionResponse::failure(
+        return Ok(Json(ToolCallResponse::failure(
             "Invalid timestamp in message",
         )));
     };
 
-    let verb = request.verb.as_str();
+    let name = &request.name;
+    let tool_when = match tool_when_from_input(&request.input) {
+        Ok(value) => value,
+        Err(message) => return Ok(Json(ToolCallResponse::failure(message))),
+    };
+    let target_when = tool_when.unwrap_or(when);
 
-    match verb {
+    match name.as_str() {
         "done" => {
             let mut manager = db::load_rhythm_manager(&state.pool, user_id).await?;
-            manager.mark_done_at(rhythm_id, when)?;
+            manager.mark_done_at(rhythm_id, target_when)?;
             for event in manager.events() {
-                if event.rhythm_id == rhythm_id && event.when == when {
+                if event.rhythm_id == rhythm_id && event.when == target_when {
                     db::save_event(&state.pool, user_id, event).await?;
                     break;
                 }
             }
-            Ok(Json(ActionResponse::success_with_message("Marked as done")))
+            Ok(Json(ToolCallResponse::success_with_message(
+                "Marked as done",
+            )))
         }
         "defer" => {
             let mut manager = db::load_rhythm_manager(&state.pool, user_id).await?;
-            manager.defer_rhythm_at(rhythm_id, when)?;
+            manager.defer_rhythm_at(rhythm_id, target_when)?;
             for event in manager.events() {
-                if event.rhythm_id == rhythm_id && event.when == when {
+                if event.rhythm_id == rhythm_id && event.when == target_when {
                     db::save_event(&state.pool, user_id, event).await?;
                     break;
                 }
             }
-            Ok(Json(ActionResponse::success_with_message("Deferred")))
+            Ok(Json(ToolCallResponse::success_with_message("Deferred")))
         }
-        _ => Ok(Json(ActionResponse::failure(format!(
-            "Unknown verb: {}",
-            verb
+        _ => Ok(Json(ToolCallResponse::failure(format!(
+            "Unknown tool: {}",
+            name
         )))),
     }
 }
