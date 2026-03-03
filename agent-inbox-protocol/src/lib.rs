@@ -273,6 +273,7 @@ mod tests {
             description: Some("Mark as done".to_string()),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
             cache_control: None,
+            strict: None,
         };
 
         let message = Message {
