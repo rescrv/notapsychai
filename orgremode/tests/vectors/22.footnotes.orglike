@@ -1,0 +1,4 @@
+* Footnotes
+Inline reference[fn:1] and labeled def[fn:label:Definition text].
+Anonymous def[fn::Inline definition].
+Another reference[fn:label].

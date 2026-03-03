@@ -1,0 +1,5 @@
+* Centered
+#+BEGIN_CENTER
+A centered paragraph.
+- Item in centered list
+#+END_CENTER

@@ -1,0 +1,7 @@
+* Links
+See [[https://example.com][Example]] and [[https://example.com]].
+File link [[file:docs/readme.org]].
+ID link [[id:abc-123]].
+Custom id [[#section-1]].
+Code ref [[(myfunc)]].
+Fuzzy link [[Just a headline]].

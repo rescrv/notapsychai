@@ -1,0 +1,7 @@
+* Task with properties
+:PROPERTIES:
+:ID: 123
+:CUSTOM_ID: task-1
+:Effort: 2h
+:END:
+Body text after properties.

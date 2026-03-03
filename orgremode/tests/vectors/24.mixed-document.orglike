@@ -1,0 +1,24 @@
+#+TITLE: Mixed Document
+
+Intro text before any headline.
+
+* Project Alpha :work:
+SCHEDULED: <2024-03-01 Fri> DEADLINE: <2024-03-10 Sun>
+:PROPERTIES:
+:ID: alpha
+:OWNER: team-a
+:END:
+Overview paragraph with a [[https://example.com][link]] and *bold* text.
+
+** TODO [#C] First task :task:
+- [ ] Item one
+- [X] Item two
+
+** Notes
+#+BEGIN_QUOTE
+Quoted note with a [fn:note].
+#+END_QUOTE
+
+* Timebox
+CLOCK: [2024-03-02 Sat 09:00]--[2024-03-02 Sat 10:00] => 1:00
+After clock entry.

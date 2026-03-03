@@ -1,0 +1,5 @@
+* Comment
+#+BEGIN_COMMENT
+This should be ignored by semantics.
+Even with *markup* and [[links]].
+#+END_COMMENT

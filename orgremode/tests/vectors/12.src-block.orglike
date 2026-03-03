@@ -1,0 +1,6 @@
+* Code
+#+BEGIN_SRC rust :results output
+fn main() {
+    println!("hi");
+}
+#+END_SRC

@@ -1,0 +1,34 @@
+* Plan
+- Cover headlines and nesting
+- Cover TODO/DONE, priorities, COMMENT, and tags
+- Cover planning lines and property drawers
+- Cover drawers, keywords, comments, fixed width, and horizontal rules
+- Cover lists: unordered, ordered, description, nested, checkboxes, counter set
+- Cover blocks: src, quote, example, verse, center, comment
+- Cover timestamps, clocks, links, footnotes, statistics cookies, line breaks, and markup
+
+* TODO
+- [X] 01.headlines-basic.orglike
+- [X] 02.headline-todo-priority-comment-tags.orglike
+- [X] 03.planning-lines.orglike
+- [X] 04.property-drawer.orglike
+- [X] 05.drawer-logbook.orglike
+- [X] 06.keywords-and-comments.orglike
+- [X] 07.fixed-width-and-hr.orglike
+- [X] 08.unordered-list.orglike
+- [X] 09.ordered-list.orglike
+- [X] 10.description-list.orglike
+- [X] 11.nested-list.orglike
+- [X] 12.src-block.orglike
+- [X] 13.quote-block.orglike
+- [X] 14.example-block.orglike
+- [X] 15.verse-block.orglike
+- [X] 16.center-block.orglike
+- [X] 17.comment-block.orglike
+- [X] 18.timestamps.orglike
+- [X] 19.clock-entry.orglike
+- [X] 20.inline-markup.orglike
+- [X] 21.links.orglike
+- [X] 22.footnotes.orglike
+- [X] 23.statistics-cookies.orglike
+- [X] 24.mixed-document.orglike

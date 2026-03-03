@@ -1,0 +1,8 @@
+* Timestamps
+Active: <2024-01-15 Mon>
+Inactive: [2024-01-16 Tue]
+Range with time: <2024-01-20 Sat 10:00-12:30>
+Range with end timestamp: [2024-01-21]--[2024-01-22]
+Repeater: <2024-02-01 Thu +1w>
+Warning: <2024-02-10 Sat -2d>
+Repeater and warning: <2024-02-15 Thu ++1m -3d>
