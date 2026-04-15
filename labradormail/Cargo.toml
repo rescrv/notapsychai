@@ -3,6 +3,7 @@ name = "labradormail"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0"
+description = "Labradormail is a fork of neomutt in Rust, adapted to use agent-inbox-protocol."
 
 [dependencies]
 agent-inbox-protocol = { path = "../agent-inbox-protocol", features = ["client", "server"] }

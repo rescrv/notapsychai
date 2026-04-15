@@ -2,6 +2,8 @@
 name = "agent-inbox-protocol"
 version = "0.1.0"
 edition = "2024"
+description = "Agent inbox protocol abstracts queryable data as email."
+license = "Apache-2.0"
 
 [dependencies]
 async-trait = "0.1.89"
