@@ -1,30 +1,32 @@
 [package]
-name = "notapsychai-cadence"
+name = "cadence-agent"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "cadence"
+path = "src/bin/cadence.rs"
+
+[[bin]]
+name = "cadence-agent"
+path = "src/bin/cadence-agent.rs"
+
 [dependencies]
-agent-inbox-protocol = { path = "../agent-inbox-protocol", features = ["server"] }
-argon2 = { workspace = true }
-arrrg = { workspace = true } 
+arrrg = { workspace = true }
 arrrg_derive = { workspace = true }
-axum = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+claudius = { workspace = true }
 crossterm = { workspace = true }
+ctrlc = { workspace = true }
 dirs = { workspace = true }
 edit = { workspace = true }
 getopts = { workspace = true }
-jsonwebtoken = { workspace = true }
 one_two_eight = { workspace = true }
 ratatui = { workspace = true }
-reqwest = { workspace = true }
-rpassword = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sha2.workspace = true
-sqlx = { workspace = true }
 tokio = { workspace = true }
-tower-http = { workspace = true }
 uuid = { workspace = true }

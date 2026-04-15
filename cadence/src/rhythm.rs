@@ -44,7 +44,7 @@ impl TryFrom<&Uuid> for RhythmID {
 
 ////////////////////////////////////////////// Slider //////////////////////////////////////////////
 
-#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Slider {
     pub before: u32,
 }
@@ -57,7 +57,7 @@ impl Slider {
 
 ////////////////////////////////////////////// Rhythm //////////////////////////////////////////////
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Rhythm {
     Daily {
@@ -254,7 +254,7 @@ impl std::fmt::Display for Rhythm {
 
 ///////////////////////////////////////// RhythmDefinition /////////////////////////////////////////
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RhythmDefinition {
     pub id: RhythmID,
     pub rhythm: Rhythm,
@@ -309,7 +309,7 @@ impl FromStr for EventType {
 
 //////////////////////////////////////////// EventRecord ///////////////////////////////////////////
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct EventRecord {
     pub rhythm_id: RhythmID,
     pub event_type: EventType,
@@ -388,6 +388,8 @@ impl RhythmManager {
         rhythm_id: RhythmID,
         when: DateTime<Utc>,
     ) -> Result<(), crate::Error> {
+        self.events
+            .retain(|event| !(event.rhythm_id == rhythm_id && event.event_type == EventType::Done));
         let event = EventRecord {
             rhythm_id,
             event_type: EventType::Done,
@@ -407,6 +409,9 @@ impl RhythmManager {
         rhythm_id: RhythmID,
         when: DateTime<Utc>,
     ) -> Result<(), crate::Error> {
+        self.events.retain(|event| {
+            !(event.rhythm_id == rhythm_id && event.event_type == EventType::Defer)
+        });
         let event = EventRecord {
             rhythm_id,
             event_type: EventType::Defer,

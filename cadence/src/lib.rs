@@ -3,13 +3,22 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 
 pub mod api_types;
-pub mod auth;
-pub mod db;
+pub mod app;
 mod rhythm;
+pub mod store;
 
+pub use app::{
+    RhythmInput, RhythmKind, RhythmUpdate, TodayRenderOptions, add_rhythm, build_rhythm,
+    convergence_response, default_file_path, defer_rhythm, defer_rhythm_at, delete_rhythm,
+    delinquent_items, document_timezone, format_rhythm, list_rhythms, load_document,
+    mark_rhythm_done, mark_rhythm_done_at, parse_date, parse_rhythm_id, parse_time,
+    render_delinquent_items, render_schedule_items, render_today_items, rhythm_kind_name,
+    save_document, schedule_items, set_spoons, today_items, update_rhythm,
+};
 pub use rhythm::{
     EventRecord, EventType, Rhythm, RhythmDefinition, RhythmID, RhythmManager, Slider,
 };
+pub use store::{CadenceDocument, StoredEventRecord, StoredRhythm};
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
@@ -22,20 +31,19 @@ pub enum Error {
     Internal(String),
     IO(std::io::Error),
     Json(serde_json::Error),
+    Yaml(serde_yaml::Error),
     FromUtf8Error(std::string::FromUtf8Error),
-    Sqlx(sqlx::Error),
-}
-
-impl Error {
-    #[allow(dead_code)]
-    fn internal(s: impl Into<String>) -> Self {
-        Self::Internal(s.into())
-    }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{self:#?}")
+        match self {
+            Self::Internal(message) => f.write_str(message),
+            Self::IO(err) => err.fmt(f),
+            Self::Json(err) => err.fmt(f),
+            Self::Yaml(err) => err.fmt(f),
+            Self::FromUtf8Error(err) => err.fmt(f),
+        }
     }
 }
 
@@ -53,15 +61,15 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<std::string::FromUtf8Error> for Error {
-    fn from(err: std::string::FromUtf8Error) -> Self {
-        Self::FromUtf8Error(err)
+impl From<serde_yaml::Error> for Error {
+    fn from(err: serde_yaml::Error) -> Self {
+        Self::Yaml(err)
     }
 }
 
-impl From<sqlx::Error> for Error {
-    fn from(err: sqlx::Error) -> Self {
-        Self::Sqlx(err)
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        Self::FromUtf8Error(err)
     }
 }
 

@@ -1,8 +1,8 @@
 #[cfg(all(feature = "client", feature = "server"))]
 mod integration {
     use agent_inbox_protocol::{
-        router, Body, Client, From, Mailbox, MailboxName, MailboxProvider, Message, MessageID,
-        QueryParameters, QueryResult, ToolCallRequest, ToolCallResponse,
+        Body, Client, From, Mailbox, MailboxName, MailboxProvider, Message, MessageID,
+        QueryParameters, QueryResult, ToolCallRequest, ToolCallResponse, router,
     };
     use chrono::Utc;
     use tokio::net::TcpListener;
