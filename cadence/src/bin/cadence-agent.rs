@@ -6,8 +6,7 @@
 //! Usage: `cadence-agent [--file PATH]`
 
 use std::any::Any;
-use std::io::BufRead;
-use std::io::Write;
+use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,20 +28,17 @@ use chrono_tz::Tz;
 use claudius::Agent;
 use claudius::AgentStreamContext;
 use claudius::Anthropic;
-use claudius::Budget;
-use claudius::CacheControlEphemeral;
 use claudius::ContentBlock;
 use claudius::IntermediateToolResult;
 use claudius::Message;
 use claudius::MessageParam;
-use claudius::MessageParamContent;
-use claudius::MessageRole;
 use claudius::Model;
+use claudius::OperatorLine;
 use claudius::PlainTextRenderer;
 use claudius::Renderer;
 use claudius::StopReason;
+use claudius::StreamContext;
 use claudius::SystemPrompt;
-use claudius::TextBlock;
 use claudius::Tool;
 use claudius::ToolCallback;
 use claudius::ToolParam;
@@ -51,6 +47,9 @@ use claudius::ToolResultBlock;
 use claudius::ToolResultBlockContent;
 use claudius::ToolUnionParam;
 use claudius::ToolUseBlock;
+use claudius::chat::{ChatAgent, ChatConfig, ChatSession, SessionStats};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use serde_json::Value;
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../prompts/default-system.md");
@@ -130,6 +129,7 @@ struct CadenceAgent {
     document: SharedDocument,
     mutation_counter: Arc<MutationCounter>,
     file_path: PathBuf,
+    config: ChatConfig,
 }
 
 impl CadenceAgent {
@@ -137,12 +137,24 @@ impl CadenceAgent {
         document: SharedDocument,
         mutation_counter: Arc<MutationCounter>,
         file_path: PathBuf,
+        config: ChatConfig,
     ) -> Self {
         Self {
             document,
             mutation_counter,
             file_path,
+            config,
         }
+    }
+}
+
+impl ChatAgent for CadenceAgent {
+    fn config(&self) -> &ChatConfig {
+        &self.config
+    }
+
+    fn config_mut(&mut self) -> &mut ChatConfig {
+        &mut self.config
     }
 }
 
@@ -162,6 +174,10 @@ impl Agent for CadenceAgent {
 
     fn stream_label(&self) -> String {
         "CadenceAgent".to_string()
+    }
+
+    fn caching_enabled(&self) -> bool {
+        self.config.caching_enabled
     }
 
     async fn tools(&self) -> Vec<Arc<dyn Tool<Self>>> {
@@ -217,7 +233,7 @@ impl Agent for CadenceAgent {
                     tool_use_id: tool_use.id.clone(),
                     content: Some(ToolResultBlockContent::String(msg)),
                     is_error: Some(true),
-                    cache_control: Some(CacheControlEphemeral::new()),
+                    cache_control: None,
                 };
                 tool_results.push(ContentBlock::ToolResult(block));
                 continue;
@@ -233,13 +249,10 @@ impl Agent for CadenceAgent {
                 .await
             {
                 ControlFlow::Continue(result) => {
-                    let mut block = match result {
+                    let block = match result {
                         Ok(block) => block,
                         Err(block) => block.with_error(true),
                     };
-                    if block.cache_control.is_none() {
-                        block.cache_control = Some(CacheControlEphemeral::new());
-                    }
                     tool_results.push(ContentBlock::ToolResult(block));
                 }
                 ControlFlow::Break(err) => {
@@ -1546,7 +1559,7 @@ impl<A: Agent> Tool<A> for AskQuestionsTool {
     }
 
     fn callback(&self) -> Box<dyn ToolCallback<A> + '_> {
-        cadence_tool_callback(AskQuestionsCallback)
+        Box::new(AskQuestionsToolCallback)
     }
 
     fn to_param(&self) -> ToolUnionParam {
@@ -1565,15 +1578,30 @@ impl<A: Agent> Tool<A> for AskQuestionsTool {
     }
 }
 
-struct AskQuestionsCallback;
+struct AskQuestionsToolCallback;
 
 #[async_trait::async_trait]
-impl<A: Agent> CadenceToolLogic<A> for AskQuestionsCallback {
-    async fn compute(
+impl<A: Agent> ToolCallback<A> for AskQuestionsToolCallback {
+    async fn compute_tool_result(
         &self,
         _client: &Anthropic,
         _agent: &A,
         tool_use: &ToolUseBlock,
+    ) -> Box<dyn IntermediateToolResult> {
+        // Fallback for non-streaming context: return an error since we need a renderer.
+        tool_err(
+            &tool_use.id,
+            "ask_questions requires an interactive session",
+        )
+    }
+
+    async fn compute_tool_result_streaming(
+        &self,
+        _client: &Anthropic,
+        _agent: &A,
+        tool_use: &ToolUseBlock,
+        renderer: &mut dyn Renderer,
+        _context: &AgentStreamContext,
     ) -> Box<dyn IntermediateToolResult> {
         let questions = match tool_use
             .input
@@ -1599,12 +1627,16 @@ impl<A: Agent> CadenceToolLogic<A> for AskQuestionsCallback {
                 }
             };
             println!("\n[Question from agent]: {question}");
-            match read_user_input() {
-                Ok(Some(answer)) => {
+            match renderer.read_operator_line("> ") {
+                Ok(Some(OperatorLine::Line(answer))) => {
+                    let answer = answer.trim().to_string();
                     answers.push((question.to_string(), answer));
                 }
-                Ok(None) => {
+                Ok(Some(OperatorLine::Eof)) | Ok(None) => {
                     return tool_err(&tool_use.id, "End of input while answering questions");
+                }
+                Ok(Some(OperatorLine::Interrupted)) => {
+                    return tool_err(&tool_use.id, "Interrupted while answering questions");
                 }
                 Err(e) => {
                     return tool_err(&tool_use.id, format!("Error reading input: {e}"));
@@ -1620,52 +1652,40 @@ impl<A: Agent> CadenceToolLogic<A> for AskQuestionsCallback {
 
         tool_ok(&tool_use.id, response)
     }
+
+    async fn apply_tool_result(
+        &self,
+        _client: &Anthropic,
+        _agent: &mut A,
+        _tool_use: &ToolUseBlock,
+        intermediate: Box<dyn IntermediateToolResult>,
+    ) -> ToolResult {
+        apply_cadence_tool_result(intermediate)
+    }
 }
 
 ////////////////////////////////////////////// REPL ////////////////////////////////////////////////
-
-/// Creates a user message from text input.
-fn create_user_message(text: &str) -> MessageParam {
-    MessageParam {
-        role: MessageRole::User,
-        content: MessageParamContent::Array(vec![ContentBlock::Text(TextBlock {
-            text: text.to_string(),
-            citations: None,
-            cache_control: None,
-        })]),
-    }
-}
-
-/// Reads a line of input from the user.
-fn read_user_input() -> std::io::Result<Option<String>> {
-    print!("> ");
-    std::io::stdout().flush()?;
-
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    let bytes_read = stdin.lock().read_line(&mut line)?;
-
-    if bytes_read == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(line.trim().to_string()))
-}
 
 const HELP_TEXT: &str = "Commands:
   /today              Show today's items
   /list               List all rhythms
   /delinquent         Show delinquent rhythms
+  /cache [on|off]     Show or change prompt caching (default: on)
+  /stats              Show token and cache usage
+  /config             Show session configuration
   /quit | /exit       End session";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum Command {
     Today,
     List,
     Delinquent,
+    Cache(Option<bool>),
+    Stats,
+    Config,
     Help,
     Quit,
-    Unknown(String),
+    Invalid(String),
 }
 
 fn parse_command(input: &str) -> Option<Command> {
@@ -1673,25 +1693,119 @@ fn parse_command(input: &str) -> Option<Command> {
     if !trimmed.starts_with('/') {
         return None;
     }
-    let cmd = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_lowercase();
+
+    let mut parts = trimmed.split_whitespace();
+    let cmd = parts.next().unwrap_or_default().to_lowercase();
+    let arg = parts.next().map(str::to_lowercase);
+
     let command = match cmd.as_str() {
         "/today" => Command::Today,
         "/list" => Command::List,
         "/delinquent" => Command::Delinquent,
+        "/cache" => match arg.as_deref() {
+            None => Command::Cache(None),
+            Some("on" | "true" | "yes" | "enable" | "enabled") => Command::Cache(Some(true)),
+            Some("off" | "false" | "no" | "disable" | "disabled") => {
+                Command::Cache(Some(false))
+            }
+            Some(_) => Command::Invalid("/cache expects 'on' or 'off'".to_string()),
+        },
+        "/stats" | "/status" => Command::Stats,
+        "/config" => Command::Config,
         "/help" => Command::Help,
         "/quit" | "/exit" => Command::Quit,
-        other => Command::Unknown(format!("unknown command: {other}")),
+        other => Command::Invalid(format!("unknown command: {other}")),
     };
     Some(command)
+}
+
+fn enabled_disabled(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn format_optional_count(value: Option<u64>) -> String {
+    value.map(format_count).unwrap_or_else(|| "n/a".to_string())
+}
+
+fn print_session_config(stats: &SessionStats) {
+    let system_prompt = stats
+        .system_prompt
+        .as_ref()
+        .map(|prompt| format!("configured ({} chars)", format_count(prompt.len() as u64)))
+        .unwrap_or_else(|| "none".to_string());
+    let transcript = stats
+        .transcript_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "disabled".to_string());
+
+    println!("Model: {}", stats.model);
+    println!("Max tokens: {}", format_count(stats.max_tokens as u64));
+    println!("Prompt caching: {}", enabled_disabled(stats.caching_enabled));
+    println!("System prompt: {system_prompt}");
+    println!("Transcript: {transcript}");
+}
+
+fn print_session_stats(stats: &SessionStats) {
+    print_session_config(stats);
+    println!("Messages: {}", format_count(stats.message_count as u64));
+    println!("Requests: {}", format_count(stats.total_requests));
+    println!(
+        "Last turn: input {}, output {}",
+        format_optional_count(stats.last_turn_input_tokens),
+        format_optional_count(stats.last_turn_output_tokens),
+    );
+    println!(
+        "Totals: input {}, output {}",
+        format_count(stats.total_input_tokens),
+        format_count(stats.total_output_tokens),
+    );
+    println!(
+        "Cache totals: write {}, read {}",
+        format_count(stats.total_cache_creation_tokens),
+        format_count(stats.total_cache_read_tokens),
+    );
+}
+
+fn print_turn_usage(previous: &SessionStats, current: &SessionStats) {
+    let cache_write = current
+        .total_cache_creation_tokens
+        .saturating_sub(previous.total_cache_creation_tokens);
+    let cache_read = current
+        .total_cache_read_tokens
+        .saturating_sub(previous.total_cache_read_tokens);
+    let requests = current.total_requests.saturating_sub(previous.total_requests);
+
+    println!(
+        "[usage] input {}, output {}, cache write {}, cache read {}, requests {}",
+        format_optional_count(current.last_turn_input_tokens),
+        format_optional_count(current.last_turn_output_tokens),
+        format_count(cache_write),
+        format_count(cache_read),
+        format_count(requests),
+    );
 }
 
 fn handle_command(
     command: Command,
     document: &SharedDocument,
+    session: &mut ChatSession<CadenceAgent>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match command {
         Command::Today => {
@@ -1719,16 +1833,237 @@ fn handle_command(
             let items = delinquent_items(&doc)?;
             println!("{}", render_delinquent_items(&items));
         }
+        Command::Cache(enabled) => match enabled {
+            Some(enabled) => {
+                session.config_mut().caching_enabled = enabled;
+                println!("Prompt caching {}.", enabled_disabled(enabled));
+            }
+            None => {
+                let enabled = session.config().caching_enabled;
+                println!(
+                    "Prompt caching is {}. Use /cache off to disable it.",
+                    enabled_disabled(enabled),
+                );
+            }
+        },
+        Command::Stats => {
+            let stats = session.stats();
+            print_session_stats(&stats);
+        }
+        Command::Config => {
+            let stats = session.stats();
+            print_session_config(&stats);
+        }
         Command::Help => {
             println!("{HELP_TEXT}");
         }
         Command::Quit => return Ok(false),
-        Command::Unknown(message) => {
+        Command::Invalid(message) => {
             println!("{message}");
             println!("Type /help for commands.");
         }
     }
     Ok(true)
+}
+
+////////////////////////////////////////// CadenceTerminal /////////////////////////////////////////
+
+/// Interactive terminal combining rustyline input with streaming output.
+struct CadenceTerminal {
+    editor: DefaultEditor,
+    history_path: PathBuf,
+    renderer: PlainTextRenderer,
+}
+
+impl CadenceTerminal {
+    fn new(interrupted: Arc<AtomicBool>) -> Result<Self, Box<dyn std::error::Error>> {
+        let history_path = readline_history_path();
+        let mut editor = DefaultEditor::new()?;
+        match editor.load_history(&history_path) {
+            Ok(()) => {}
+            Err(ReadlineError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Box::new(err)),
+        }
+        Ok(Self {
+            editor,
+            history_path,
+            renderer: PlainTextRenderer::with_color_and_interrupt(true, interrupted),
+        })
+    }
+
+    fn read_line(&mut self, prompt: &str) -> io::Result<OperatorLine> {
+        match self.editor.readline(prompt) {
+            Ok(line) => {
+                self.save_history_entry(&line);
+                Ok(OperatorLine::Line(line))
+            }
+            Err(ReadlineError::Interrupted) => Ok(OperatorLine::Interrupted),
+            Err(ReadlineError::Eof) => Ok(OperatorLine::Eof),
+            Err(err) => Err(io::Error::other(err.to_string())),
+        }
+    }
+
+    fn save_history_entry(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+
+        match self.editor.add_history_entry(line) {
+            Ok(true) => {
+                if let Err(err) = self.editor.save_history(&self.history_path) {
+                    eprintln!(
+                        "Failed to save readline history to {}: {err}",
+                        self.history_path.display(),
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("Failed to record readline history: {err}");
+            }
+        }
+    }
+}
+
+impl Renderer for CadenceTerminal {
+    fn start_agent(&mut self, context: &dyn StreamContext) {
+        self.renderer.start_agent(context);
+    }
+
+    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.renderer.finish_agent(context, stop_reason);
+    }
+
+    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_text(context, text);
+    }
+
+    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_thinking(context, text);
+    }
+
+    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
+        self.renderer.print_error(context, error);
+    }
+
+    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
+        self.renderer.print_info(context, info);
+    }
+
+    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
+        self.renderer.start_tool_use(context, name, id);
+    }
+
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        self.renderer.print_tool_input(context, partial_json);
+    }
+
+    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_use(context);
+    }
+
+    fn start_tool_result(
+        &mut self,
+        context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.renderer
+            .start_tool_result(context, tool_use_id, is_error);
+    }
+
+    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_tool_result_text(context, text);
+    }
+
+    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_result(context);
+    }
+
+    fn finish_response(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_response(context);
+    }
+
+    fn print_interrupted(&mut self, context: &dyn StreamContext) {
+        self.renderer.print_interrupted(context);
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.renderer.should_interrupt()
+    }
+
+    fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
+        self.read_line(prompt).map(Some)
+    }
+}
+
+/// Returns the Cadence agent state directory, creating it if necessary.
+fn agent_state_dir() -> PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rhythm");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Returns the transcript auto-save directory, creating it if necessary.
+fn transcript_dir() -> PathBuf {
+    let dir = agent_state_dir().join("sessions");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Generates a timestamped transcript path for auto-save.
+fn transcript_path() -> PathBuf {
+    let now = chrono::Local::now();
+    let filename = now.format("%Y-%m-%dT%H-%M-%S.json").to_string();
+    transcript_dir().join(filename)
+}
+
+/// Returns the readline history path for the interactive terminal.
+fn readline_history_path() -> PathBuf {
+    agent_state_dir().join("history.txt")
+}
+
+fn serialize_document(document: &CadenceDocument) -> Result<String, cadence_agent::Error> {
+    Ok(serde_yaml::to_string(document)?)
+}
+
+fn snapshot_document(document: &SharedDocument) -> Result<String, cadence_agent::Error> {
+    let doc = document.lock().unwrap();
+    serialize_document(&doc)
+}
+
+fn save_document_if_changed(
+    document: &SharedDocument,
+    file_path: &Path,
+    previous: &str,
+) -> Result<bool, cadence_agent::Error> {
+    let doc = document.lock().unwrap();
+    if serialize_document(&doc)? == previous {
+        return Ok(false);
+    }
+    save_document(file_path, &doc)?;
+    Ok(true)
+}
+
+fn timestamped_user_message_content(input: &str, timestamp: chrono::DateTime<Tz>) -> String {
+    format!(
+        "Current timestamp: {} ({})\n\n{}",
+        timestamp.to_rfc3339(),
+        timestamp.timezone(),
+        input
+    )
+}
+
+fn create_timestamped_user_message(input: &str, document: &SharedDocument) -> MessageParam {
+    let tz = {
+        let doc = document.lock().unwrap();
+        document_timezone(&doc).unwrap_or(Tz::UTC)
+    };
+    let now = chrono::Utc::now().with_timezone(&tz);
+    MessageParam::user(timestamped_user_message_content(input, now))
 }
 
 #[tokio::main]
@@ -1748,8 +2083,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?));
 
     let client = Anthropic::new(None)?;
-    // TODO(rescrv):  Proper haiku 4.5 rates; this is opus 4.5.
-    let budget = Arc::new(Budget::new_with_rates(1_000_000_000, 500, 2500, 625, 50));
 
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_clone = interrupted.clone();
@@ -1760,10 +2093,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mutation_counter = Arc::new(MutationCounter::new(
         options.mutation_cap.unwrap_or(DEFAULT_MUTATION_CAP),
     ));
-    let mut messages: Vec<MessageParam> = Vec::new();
+
+    let save_path = transcript_path();
+    let config = ChatConfig::new()
+        .with_model(Model::Custom("claude-haiku-4-5".to_string()))
+        .with_max_tokens(64000)
+        .with_caching(true)
+        .with_transcript_path(Some(save_path.clone()));
+
+    let agent = CadenceAgent::new(
+        Arc::clone(&document),
+        Arc::clone(&mutation_counter),
+        file_path.clone(),
+        config,
+    );
+
+    let mut session = ChatSession::with_agent(client, agent);
+    let mut terminal = CadenceTerminal::new(interrupted.clone())?;
+    let context = ();
 
     println!("=== Cadence Agent ===");
     println!("File: {}", file_path.display());
+    println!("Transcript: {}", save_path.display());
+    println!("Prompt caching: enabled (use /cache off to disable).");
     println!("Chat with the assistant to manage your rhythms.");
     println!("Type '/help' for commands.");
     println!("Type 'quit' or 'exit' to end the session.");
@@ -1772,72 +2124,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         interrupted.store(false, Ordering::Relaxed);
 
-        let input = match read_user_input()? {
-            Some(input) => input,
-            None => {
+        match terminal.read_line("> ") {
+            Ok(OperatorLine::Line(line)) => {
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
+
+                let input_lower = input.to_lowercase();
+                if input_lower == "quit" || input_lower == "exit" {
+                    println!("\nEnding session.");
+                    break;
+                }
+
+                if let Some(command) = parse_command(input) {
+                    let pre_command = snapshot_document(&document)?;
+                    let keep_going = handle_command(command, &document, &mut session)?;
+                    if let Err(err) = save_document_if_changed(&document, &file_path, &pre_command)
+                    {
+                        terminal.print_error(
+                            &context,
+                            &format!("Failed to auto-save {}: {err}", file_path.display()),
+                        );
+                    }
+                    if !keep_going {
+                        println!("\nEnding session.");
+                        break;
+                    }
+                    continue;
+                }
+
+                mutation_counter.reset();
+                let pre_turn = snapshot_document(&document)?;
+                let stats_before = session.stats();
+                let message = create_timestamped_user_message(input, &document);
+
+                println!("CadenceAgent:");
+                match session.send_message(message, &mut terminal).await {
+                    Ok(()) => {
+                        println!();
+                        let stats_after = session.stats();
+                        print_turn_usage(&stats_before, &stats_after);
+                    }
+                    Err(e) => {
+                        terminal.print_error(&context, &e.to_string());
+                        println!();
+                    }
+                }
+                if let Err(err) = save_document_if_changed(&document, &file_path, &pre_turn) {
+                    terminal.print_error(
+                        &context,
+                        &format!("Failed to auto-save {}: {err}", file_path.display()),
+                    );
+                }
+
+            }
+            Ok(OperatorLine::Interrupted) => {
+                println!();
+                continue;
+            }
+            Ok(OperatorLine::Eof) => {
                 println!("\nEnd of input. Exiting.");
                 break;
             }
-        };
-
-        if input.is_empty() {
-            continue;
-        }
-
-        let input_lower = input.to_lowercase();
-        if input_lower == "quit" || input_lower == "exit" {
-            println!("\nEnding session.");
-            break;
-        }
-
-        if let Some(command) = parse_command(&input) {
-            let keep_going = handle_command(command, &document)?;
-            if !keep_going {
-                println!("\nEnding session.");
+            Err(err) => {
+                terminal.print_error(&context, &format!("Input error: {err}"));
                 break;
             }
-            continue;
-        }
-
-        messages.push(create_user_message(&input));
-
-        mutation_counter.reset();
-        let mut agent = CadenceAgent::new(
-            Arc::clone(&document),
-            Arc::clone(&mutation_counter),
-            file_path.clone(),
-        );
-
-        let mut renderer = PlainTextRenderer::with_color_and_interrupt(true, interrupted.clone());
-        let context = ();
-
-        match agent
-            .take_turn_streaming_root(&client, &mut messages, &budget, &mut renderer)
-            .await
-        {
-            Ok(outcome) => {
-                renderer.finish_response(&context);
-                println!();
-
-                if outcome.stop_reason != StopReason::EndTurn {
-                    eprintln!("Note: Unexpected stop reason: {:?}", outcome.stop_reason);
-                }
-            }
-            Err(e) => {
-                renderer.print_error(&context, &e.to_string());
-                println!();
-            }
-        }
-
-        let mutations = mutation_counter.count.load(Ordering::Relaxed);
-        if mutations > 0 {
-            println!(
-                "\n[{} mutation{} this turn.]",
-                mutations,
-                if mutations == 1 { "" } else { "s" },
-            );
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cache_status_command() {
+        assert_eq!(parse_command("/cache"), Some(Command::Cache(None)));
+    }
+
+    #[test]
+    fn parse_cache_disable_command() {
+        assert_eq!(parse_command("/cache off"), Some(Command::Cache(Some(false))));
+    }
+
+    #[test]
+    fn parse_invalid_cache_command() {
+        assert!(matches!(
+            parse_command("/cache maybe"),
+            Some(Command::Invalid(message)) if message.contains("expects")
+        ));
+    }
+
+    #[test]
+    fn timestamped_message_content_includes_timestamp_and_body() {
+        let tz = Tz::UTC;
+        let timestamp = chrono::TimeZone::with_ymd_and_hms(&tz, 2026, 5, 2, 12, 34, 56)
+            .single()
+            .expect("valid timestamp");
+        let content = timestamped_user_message_content("review my rhythms", timestamp);
+
+        assert!(content.contains("Current timestamp: 2026-05-02T12:34:56+00:00 (UTC)"));
+        assert!(content.ends_with("\n\nreview my rhythms"));
+    }
 }
