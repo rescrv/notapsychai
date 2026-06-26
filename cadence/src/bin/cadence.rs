@@ -737,10 +737,8 @@ impl GuiApp {
             terminal.draw(|f| self.ui(f))?;
 
             match event::read()? {
-                Event::Key(key) => {
-                    if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                        return Ok(None);
-                    }
+                Event::Key(key) if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc => {
+                    return Ok(None);
                 }
                 Event::Mouse(mouse) => {
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left)

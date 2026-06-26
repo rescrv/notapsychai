@@ -30,9 +30,6 @@ Mutation tools:
 - `defer_rhythm`: Defer a rhythm to its next occurrence
 - `set_spoons`: Set energy level (0-10) for a date, affecting scheduling capacity
 
-Interactive tool:
-- `ask_questions`: Ask the user questions to gather information
-
 Rhythm types:
 - `daily`: Fires every day at a specific time
 - `weekly`: Fires on a specific day of the week (0=Monday, 6=Sunday) with optional slider

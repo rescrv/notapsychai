@@ -1,12 +1,18 @@
-//! Interactive rhythm management agent.
+//! Telegram/stdin rhythm management agent.
 //!
-//! This tool provides an interactive chat interface with an AI agent to help manage
-//! recurring rhythms and habits.  The conversation operates on a YAML cadence document.
+//! This tool provides a chat interface with an AI agent to help manage recurring rhythms and
+//! habits. The conversation operates on a YAML cadence document and is driven by the durable
+//! transport loop from `claudius-telegram`.
 //!
-//! Usage: `cadence-agent [--file PATH]`
+//! Usage: `cadence-agent [--yaml DIR] [--stdin]`
+//!
+//! Telegram mode reads `--token` or `TELEGRAM_BOT_TOKEN`; either may be a raw bot
+//! token or `file://PATH`.
 
 use std::any::Any;
-use std::io;
+use std::collections::BTreeSet;
+use std::env;
+use std::fs;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,16 +34,16 @@ use chrono_tz::Tz;
 use claudius::Agent;
 use claudius::AgentStreamContext;
 use claudius::Anthropic;
+use claudius::Budget;
 use claudius::ContentBlock;
 use claudius::IntermediateToolResult;
 use claudius::Message;
 use claudius::MessageParam;
+use claudius::MessageParamContent;
+use claudius::MessageRole;
 use claudius::Model;
-use claudius::OperatorLine;
-use claudius::PlainTextRenderer;
 use claudius::Renderer;
 use claudius::StopReason;
-use claudius::StreamContext;
 use claudius::SystemPrompt;
 use claudius::Tool;
 use claudius::ToolCallback;
@@ -47,10 +53,14 @@ use claudius::ToolResultBlock;
 use claudius::ToolResultBlockContent;
 use claudius::ToolUnionParam;
 use claudius::ToolUseBlock;
-use claudius::chat::{ChatAgent, ChatConfig, ChatSession, SessionStats};
-use rustyline::DefaultEditor;
-use rustyline::error::ReadlineError;
+use claudius::TurnOutcome;
+use claudius::chat::ChatConfig;
+use claudius_telegram::{
+    Error as TelegramError, FileStateStore, Inbound, LoopConfig, PreFilter, StateStore,
+    StdinTransport, TelegramTransport, TransportState, run_agent_loop,
+};
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../prompts/default-system.md");
 
@@ -58,19 +68,43 @@ const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../prompts/default-system.m
 
 #[derive(arrrg_derive::CommandLine, Debug, Default, Eq, PartialEq)]
 struct CliOptions {
-    #[arrrg(optional, "YAML file path", "PATH")]
-    file: Option<String>,
+    #[arrrg(optional, "Directory containing per-user YAML files", "DIR")]
+    yaml: Option<String>,
     #[arrrg(optional, "Override the default mutation cap per turn", "N")]
     mutation_cap: Option<usize>,
+    #[arrrg(flag, "Use stdin/stdout transport instead of Telegram")]
+    stdin: bool,
+    #[arrrg(optional, "Durable transport state JSON path", "PATH")]
+    state: Option<String>,
+    #[arrrg(
+        optional,
+        "Telegram bot token or file://PATH (default: $TELEGRAM_BOT_TOKEN)",
+        "TOKEN"
+    )]
+    token: Option<String>,
+    #[arrrg(optional, "Telegram long-poll timeout in seconds", "SECS")]
+    poll_timeout: Option<u64>,
+    #[arrrg(flag, "Call deleteWebhook on startup before long-polling")]
+    delete_webhook_on_start: bool,
+    #[arrrg(
+        optional,
+        "Reset chat history before a turn when it exceeds this many messages; 0 resets every turn",
+        "N"
+    )]
+    history_message_threshold: Option<usize>,
 }
 
 //////////////////////////////////////////// Shared State //////////////////////////////////////////
 
 /// Shared cadence document state for the agent.
 type SharedDocument = Arc<Mutex<CadenceDocument>>;
+type SharedFilePath = Arc<Mutex<PathBuf>>;
 
 /// Maximum number of mutation tool calls allowed per agent turn.
 const DEFAULT_MUTATION_CAP: usize = 20;
+
+/// Maximum persisted chat messages to send back to the model before resetting history.
+const DEFAULT_HISTORY_MESSAGE_THRESHOLD: usize = 40;
 
 /// Tool names that do not count toward the mutation cap.
 const READ_ONLY_TOOLS: &[&str] = &[
@@ -81,7 +115,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "delinquent",
     "convergence",
     "show_spoons",
-    "ask_questions",
 ];
 
 /// Tracks mutation tool calls within a single agent turn.
@@ -128,7 +161,7 @@ impl MutationCounter {
 struct CadenceAgent {
     document: SharedDocument,
     mutation_counter: Arc<MutationCounter>,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
     config: ChatConfig,
 }
 
@@ -136,7 +169,7 @@ impl CadenceAgent {
     fn new(
         document: SharedDocument,
         mutation_counter: Arc<MutationCounter>,
-        file_path: PathBuf,
+        file_path: SharedFilePath,
         config: ChatConfig,
     ) -> Self {
         Self {
@@ -148,24 +181,14 @@ impl CadenceAgent {
     }
 }
 
-impl ChatAgent for CadenceAgent {
-    fn config(&self) -> &ChatConfig {
-        &self.config
-    }
-
-    fn config_mut(&mut self) -> &mut ChatConfig {
-        &mut self.config
-    }
-}
-
 #[async_trait::async_trait]
 impl Agent for CadenceAgent {
     async fn max_tokens(&self) -> u32 {
-        64000
+        self.config.max_tokens()
     }
 
     async fn model(&self) -> Model {
-        Model::Custom("claude-haiku-4-5".to_string())
+        self.config.model()
     }
 
     async fn system(&self) -> Option<SystemPrompt> {
@@ -180,6 +203,20 @@ impl Agent for CadenceAgent {
         self.config.caching_enabled
     }
 
+    async fn take_turn_streaming(
+        &mut self,
+        client: &Anthropic,
+        messages: &mut Vec<MessageParam>,
+        budget: &Arc<Budget>,
+        renderer: &mut dyn Renderer,
+        context: AgentStreamContext,
+    ) -> Result<TurnOutcome, claudius::Error> {
+        self.mutation_counter.reset();
+        stamp_latest_user_message(messages, &self.document);
+        self.take_default_turn_streaming(client, messages, budget, renderer, context)
+            .await
+    }
+
     async fn tools(&self) -> Vec<Arc<dyn Tool<Self>>> {
         vec![
             Arc::new(ListRhythmsTool::new(Arc::clone(&self.document))),
@@ -191,29 +228,28 @@ impl Agent for CadenceAgent {
             Arc::new(ShowSpoonsTool::new(Arc::clone(&self.document))),
             Arc::new(AddRhythmTool::new(
                 Arc::clone(&self.document),
-                self.file_path.clone(),
+                Arc::clone(&self.file_path),
             )),
             Arc::new(UpdateRhythmTool::new(
                 Arc::clone(&self.document),
-                self.file_path.clone(),
+                Arc::clone(&self.file_path),
             )),
             Arc::new(DeleteRhythmTool::new(
                 Arc::clone(&self.document),
-                self.file_path.clone(),
+                Arc::clone(&self.file_path),
             )),
             Arc::new(MarkDoneTool::new(
                 Arc::clone(&self.document),
-                self.file_path.clone(),
+                Arc::clone(&self.file_path),
             )),
             Arc::new(DeferRhythmTool::new(
                 Arc::clone(&self.document),
-                self.file_path.clone(),
+                Arc::clone(&self.file_path),
             )),
             Arc::new(SetSpoonsTool::new(
                 Arc::clone(&self.document),
-                self.file_path.clone(),
+                Arc::clone(&self.file_path),
             )),
-            Arc::new(AskQuestionsTool),
         ]
     }
 
@@ -379,6 +415,16 @@ fn save_document_or_tool_err(
 ) -> Result<(), Box<dyn IntermediateToolResult>> {
     save_document(file_path, document)
         .map_err(|e| tool_err(tool_use_id, format!("{action} but failed to save: {e}")))
+}
+
+fn save_current_document_or_tool_err(
+    tool_use_id: &str,
+    file_path: &SharedFilePath,
+    document: &CadenceDocument,
+    action: &str,
+) -> Result<(), Box<dyn IntermediateToolResult>> {
+    let file_path = file_path.lock().unwrap().clone();
+    save_document_or_tool_err(tool_use_id, &file_path, document, action)
 }
 
 fn parse_rhythm_input(tool_use: &ToolUseBlock) -> Result<RhythmInput, String> {
@@ -945,11 +991,11 @@ impl<A: Agent> CadenceToolLogic<A> for ShowSpoonsCallback {
 
 struct AddRhythmTool {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 impl AddRhythmTool {
-    fn new(document: SharedDocument, file_path: PathBuf) -> Self {
+    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
         Self {
             document,
             file_path,
@@ -1019,7 +1065,7 @@ impl<A: Agent> Tool<A> for AddRhythmTool {
 
 struct AddRhythmCallback {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 #[async_trait::async_trait]
@@ -1049,7 +1095,7 @@ impl<A: Agent> CadenceToolLogic<A> for AddRhythmCallback {
             Err(e) => return tool_err(&tool_use.id, e.to_string()),
         };
         if let Err(err) =
-            save_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Created rhythm")
+            save_current_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Created rhythm")
         {
             return err;
         }
@@ -1065,11 +1111,11 @@ impl<A: Agent> CadenceToolLogic<A> for AddRhythmCallback {
 
 struct UpdateRhythmTool {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 impl UpdateRhythmTool {
-    fn new(document: SharedDocument, file_path: PathBuf) -> Self {
+    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
         Self {
             document,
             file_path,
@@ -1144,7 +1190,7 @@ impl<A: Agent> Tool<A> for UpdateRhythmTool {
 
 struct UpdateRhythmCallback {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 #[async_trait::async_trait]
@@ -1188,7 +1234,7 @@ impl<A: Agent> CadenceToolLogic<A> for UpdateRhythmCallback {
         }
 
         if let Err(err) =
-            save_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Updated rhythm")
+            save_current_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Updated rhythm")
         {
             return err;
         }
@@ -1201,11 +1247,11 @@ impl<A: Agent> CadenceToolLogic<A> for UpdateRhythmCallback {
 
 struct DeleteRhythmTool {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 impl DeleteRhythmTool {
-    fn new(document: SharedDocument, file_path: PathBuf) -> Self {
+    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
         Self {
             document,
             file_path,
@@ -1243,7 +1289,7 @@ impl<A: Agent> Tool<A> for DeleteRhythmTool {
 
 struct DeleteRhythmCallback {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 #[async_trait::async_trait]
@@ -1265,7 +1311,7 @@ impl<A: Agent> CadenceToolLogic<A> for DeleteRhythmCallback {
         }
 
         if let Err(err) =
-            save_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Deleted rhythm")
+            save_current_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Deleted rhythm")
         {
             return err;
         }
@@ -1278,11 +1324,11 @@ impl<A: Agent> CadenceToolLogic<A> for DeleteRhythmCallback {
 
 struct MarkDoneTool {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 impl MarkDoneTool {
-    fn new(document: SharedDocument, file_path: PathBuf) -> Self {
+    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
         Self {
             document,
             file_path,
@@ -1320,7 +1366,7 @@ impl<A: Agent> Tool<A> for MarkDoneTool {
 
 struct MarkDoneCallback {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 #[async_trait::async_trait]
@@ -1365,7 +1411,7 @@ impl<A: Agent> CadenceToolLogic<A> for MarkDoneCallback {
         }
 
         if let Err(err) =
-            save_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Marked done")
+            save_current_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Marked done")
         {
             return err;
         }
@@ -1378,11 +1424,11 @@ impl<A: Agent> CadenceToolLogic<A> for MarkDoneCallback {
 
 struct DeferRhythmTool {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 impl DeferRhythmTool {
-    fn new(document: SharedDocument, file_path: PathBuf) -> Self {
+    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
         Self {
             document,
             file_path,
@@ -1420,7 +1466,7 @@ impl<A: Agent> Tool<A> for DeferRhythmTool {
 
 struct DeferRhythmCallback {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 #[async_trait::async_trait]
@@ -1440,9 +1486,12 @@ impl<A: Agent> CadenceToolLogic<A> for DeferRhythmCallback {
         if let Err(e) = defer_rhythm(&mut doc, rhythm_id) {
             return tool_err(&tool_use.id, e.to_string());
         }
-        if let Err(err) =
-            save_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Deferred rhythm")
-        {
+        if let Err(err) = save_current_document_or_tool_err(
+            &tool_use.id,
+            &self.file_path,
+            &doc,
+            "Deferred rhythm",
+        ) {
             return err;
         }
 
@@ -1454,11 +1503,11 @@ impl<A: Agent> CadenceToolLogic<A> for DeferRhythmCallback {
 
 struct SetSpoonsTool {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 impl SetSpoonsTool {
-    fn new(document: SharedDocument, file_path: PathBuf) -> Self {
+    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
         Self {
             document,
             file_path,
@@ -1503,7 +1552,7 @@ impl<A: Agent> Tool<A> for SetSpoonsTool {
 
 struct SetSpoonsCallback {
     document: SharedDocument,
-    file_path: PathBuf,
+    file_path: SharedFilePath,
 }
 
 #[async_trait::async_trait]
@@ -1539,462 +1588,12 @@ impl<A: Agent> CadenceToolLogic<A> for SetSpoonsCallback {
         }
 
         if let Err(err) =
-            save_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Set spoons")
+            save_current_document_or_tool_err(&tool_use.id, &self.file_path, &doc, "Set spoons")
         {
             return err;
         }
 
         tool_ok(&tool_use.id, format!("Spoons set to {value} for {date}"))
-    }
-}
-
-///////////////////////////////////////// AskQuestionsTool /////////////////////////////////////////
-
-/// Tool that allows the agent to ask the user questions.
-struct AskQuestionsTool;
-
-impl<A: Agent> Tool<A> for AskQuestionsTool {
-    fn name(&self) -> String {
-        "ask_questions".to_string()
-    }
-
-    fn callback(&self) -> Box<dyn ToolCallback<A> + '_> {
-        Box::new(AskQuestionsToolCallback)
-    }
-
-    fn to_param(&self) -> ToolUnionParam {
-        custom_tool_param(
-            "ask_questions",
-            "Ask the user a series of questions one at a time.  Returns the answers.",
-            json_schema(
-                &[(
-                    "questions",
-                    "Array of questions to ask the user",
-                    serde_json::json!({"type": "array", "items": {"type": "string"}}),
-                )],
-                &["questions"],
-            ),
-        )
-    }
-}
-
-struct AskQuestionsToolCallback;
-
-#[async_trait::async_trait]
-impl<A: Agent> ToolCallback<A> for AskQuestionsToolCallback {
-    async fn compute_tool_result(
-        &self,
-        _client: &Anthropic,
-        _agent: &A,
-        tool_use: &ToolUseBlock,
-    ) -> Box<dyn IntermediateToolResult> {
-        // Fallback for non-streaming context: return an error since we need a renderer.
-        tool_err(
-            &tool_use.id,
-            "ask_questions requires an interactive session",
-        )
-    }
-
-    async fn compute_tool_result_streaming(
-        &self,
-        _client: &Anthropic,
-        _agent: &A,
-        tool_use: &ToolUseBlock,
-        renderer: &mut dyn Renderer,
-        _context: &AgentStreamContext,
-    ) -> Box<dyn IntermediateToolResult> {
-        let questions = match tool_use
-            .input
-            .get("questions")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "Missing or invalid 'questions'".to_string())
-        {
-            Ok(q) => q.clone(),
-            Err(e) => return tool_err(&tool_use.id, e),
-        };
-
-        if questions.is_empty() {
-            return tool_err(&tool_use.id, "No questions provided");
-        }
-
-        let mut answers: Vec<(String, String)> = Vec::new();
-
-        for q_val in &questions {
-            let question = match q_val.as_str() {
-                Some(s) => s,
-                None => {
-                    return tool_err(&tool_use.id, "Question must be a string");
-                }
-            };
-            println!("\n[Question from agent]: {question}");
-            match renderer.read_operator_line("> ") {
-                Ok(Some(OperatorLine::Line(answer))) => {
-                    let answer = answer.trim().to_string();
-                    answers.push((question.to_string(), answer));
-                }
-                Ok(Some(OperatorLine::Eof)) | Ok(None) => {
-                    return tool_err(&tool_use.id, "End of input while answering questions");
-                }
-                Ok(Some(OperatorLine::Interrupted)) => {
-                    return tool_err(&tool_use.id, "Interrupted while answering questions");
-                }
-                Err(e) => {
-                    return tool_err(&tool_use.id, format!("Error reading input: {e}"));
-                }
-            }
-        }
-
-        let response = answers
-            .iter()
-            .map(|(q, a)| format!("Q: {q}\nA: {a}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        tool_ok(&tool_use.id, response)
-    }
-
-    async fn apply_tool_result(
-        &self,
-        _client: &Anthropic,
-        _agent: &mut A,
-        _tool_use: &ToolUseBlock,
-        intermediate: Box<dyn IntermediateToolResult>,
-    ) -> ToolResult {
-        apply_cadence_tool_result(intermediate)
-    }
-}
-
-////////////////////////////////////////////// REPL ////////////////////////////////////////////////
-
-const HELP_TEXT: &str = "Commands:
-  /today              Show today's items
-  /list               List all rhythms
-  /delinquent         Show delinquent rhythms
-  /cache [on|off]     Show or change prompt caching (default: on)
-  /stats              Show token and cache usage
-  /config             Show session configuration
-  /quit | /exit       End session";
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum Command {
-    Today,
-    List,
-    Delinquent,
-    Cache(Option<bool>),
-    Stats,
-    Config,
-    Help,
-    Quit,
-    Invalid(String),
-}
-
-fn parse_command(input: &str) -> Option<Command> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-
-    let mut parts = trimmed.split_whitespace();
-    let cmd = parts.next().unwrap_or_default().to_lowercase();
-    let arg = parts.next().map(str::to_lowercase);
-
-    let command = match cmd.as_str() {
-        "/today" => Command::Today,
-        "/list" => Command::List,
-        "/delinquent" => Command::Delinquent,
-        "/cache" => match arg.as_deref() {
-            None => Command::Cache(None),
-            Some("on" | "true" | "yes" | "enable" | "enabled") => Command::Cache(Some(true)),
-            Some("off" | "false" | "no" | "disable" | "disabled") => {
-                Command::Cache(Some(false))
-            }
-            Some(_) => Command::Invalid("/cache expects 'on' or 'off'".to_string()),
-        },
-        "/stats" | "/status" => Command::Stats,
-        "/config" => Command::Config,
-        "/help" => Command::Help,
-        "/quit" | "/exit" => Command::Quit,
-        other => Command::Invalid(format!("unknown command: {other}")),
-    };
-    Some(command)
-}
-
-fn enabled_disabled(enabled: bool) -> &'static str {
-    if enabled {
-        "enabled"
-    } else {
-        "disabled"
-    }
-}
-
-fn format_count(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (idx, ch) in digits.chars().rev().enumerate() {
-        if idx > 0 && idx % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
-}
-
-fn format_optional_count(value: Option<u64>) -> String {
-    value.map(format_count).unwrap_or_else(|| "n/a".to_string())
-}
-
-fn print_session_config(stats: &SessionStats) {
-    let system_prompt = stats
-        .system_prompt
-        .as_ref()
-        .map(|prompt| format!("configured ({} chars)", format_count(prompt.len() as u64)))
-        .unwrap_or_else(|| "none".to_string());
-    let transcript = stats
-        .transcript_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "disabled".to_string());
-
-    println!("Model: {}", stats.model);
-    println!("Max tokens: {}", format_count(stats.max_tokens as u64));
-    println!("Prompt caching: {}", enabled_disabled(stats.caching_enabled));
-    println!("System prompt: {system_prompt}");
-    println!("Transcript: {transcript}");
-}
-
-fn print_session_stats(stats: &SessionStats) {
-    print_session_config(stats);
-    println!("Messages: {}", format_count(stats.message_count as u64));
-    println!("Requests: {}", format_count(stats.total_requests));
-    println!(
-        "Last turn: input {}, output {}",
-        format_optional_count(stats.last_turn_input_tokens),
-        format_optional_count(stats.last_turn_output_tokens),
-    );
-    println!(
-        "Totals: input {}, output {}",
-        format_count(stats.total_input_tokens),
-        format_count(stats.total_output_tokens),
-    );
-    println!(
-        "Cache totals: write {}, read {}",
-        format_count(stats.total_cache_creation_tokens),
-        format_count(stats.total_cache_read_tokens),
-    );
-}
-
-fn print_turn_usage(previous: &SessionStats, current: &SessionStats) {
-    let cache_write = current
-        .total_cache_creation_tokens
-        .saturating_sub(previous.total_cache_creation_tokens);
-    let cache_read = current
-        .total_cache_read_tokens
-        .saturating_sub(previous.total_cache_read_tokens);
-    let requests = current.total_requests.saturating_sub(previous.total_requests);
-
-    println!(
-        "[usage] input {}, output {}, cache write {}, cache read {}, requests {}",
-        format_optional_count(current.last_turn_input_tokens),
-        format_optional_count(current.last_turn_output_tokens),
-        format_count(cache_write),
-        format_count(cache_read),
-        format_count(requests),
-    );
-}
-
-fn handle_command(
-    command: Command,
-    document: &SharedDocument,
-    session: &mut ChatSession<CadenceAgent>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    match command {
-        Command::Today => {
-            let doc = document.lock().unwrap();
-            let user_tz = document_timezone(&doc).unwrap_or(Tz::UTC);
-            let items = today_items(&doc)?;
-            println!(
-                "{}",
-                render_today_items(&items, &user_tz, TodayRenderOptions::default())
-            );
-        }
-        Command::List => {
-            let doc = document.lock().unwrap();
-            let rhythms = list_rhythms(&doc, None, None);
-            if rhythms.is_empty() {
-                println!("No rhythms found.");
-            } else {
-                for rhythm in rhythms {
-                    println!("{}: {} - {}", rhythm.id, rhythm.description, rhythm.rhythm);
-                }
-            }
-        }
-        Command::Delinquent => {
-            let doc = document.lock().unwrap();
-            let items = delinquent_items(&doc)?;
-            println!("{}", render_delinquent_items(&items));
-        }
-        Command::Cache(enabled) => match enabled {
-            Some(enabled) => {
-                session.config_mut().caching_enabled = enabled;
-                println!("Prompt caching {}.", enabled_disabled(enabled));
-            }
-            None => {
-                let enabled = session.config().caching_enabled;
-                println!(
-                    "Prompt caching is {}. Use /cache off to disable it.",
-                    enabled_disabled(enabled),
-                );
-            }
-        },
-        Command::Stats => {
-            let stats = session.stats();
-            print_session_stats(&stats);
-        }
-        Command::Config => {
-            let stats = session.stats();
-            print_session_config(&stats);
-        }
-        Command::Help => {
-            println!("{HELP_TEXT}");
-        }
-        Command::Quit => return Ok(false),
-        Command::Invalid(message) => {
-            println!("{message}");
-            println!("Type /help for commands.");
-        }
-    }
-    Ok(true)
-}
-
-////////////////////////////////////////// CadenceTerminal /////////////////////////////////////////
-
-/// Interactive terminal combining rustyline input with streaming output.
-struct CadenceTerminal {
-    editor: DefaultEditor,
-    history_path: PathBuf,
-    renderer: PlainTextRenderer,
-}
-
-impl CadenceTerminal {
-    fn new(interrupted: Arc<AtomicBool>) -> Result<Self, Box<dyn std::error::Error>> {
-        let history_path = readline_history_path();
-        let mut editor = DefaultEditor::new()?;
-        match editor.load_history(&history_path) {
-            Ok(()) => {}
-            Err(ReadlineError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(Box::new(err)),
-        }
-        Ok(Self {
-            editor,
-            history_path,
-            renderer: PlainTextRenderer::with_color_and_interrupt(true, interrupted),
-        })
-    }
-
-    fn read_line(&mut self, prompt: &str) -> io::Result<OperatorLine> {
-        match self.editor.readline(prompt) {
-            Ok(line) => {
-                self.save_history_entry(&line);
-                Ok(OperatorLine::Line(line))
-            }
-            Err(ReadlineError::Interrupted) => Ok(OperatorLine::Interrupted),
-            Err(ReadlineError::Eof) => Ok(OperatorLine::Eof),
-            Err(err) => Err(io::Error::other(err.to_string())),
-        }
-    }
-
-    fn save_history_entry(&mut self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() {
-            return;
-        }
-
-        match self.editor.add_history_entry(line) {
-            Ok(true) => {
-                if let Err(err) = self.editor.save_history(&self.history_path) {
-                    eprintln!(
-                        "Failed to save readline history to {}: {err}",
-                        self.history_path.display(),
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(err) => {
-                eprintln!("Failed to record readline history: {err}");
-            }
-        }
-    }
-}
-
-impl Renderer for CadenceTerminal {
-    fn start_agent(&mut self, context: &dyn StreamContext) {
-        self.renderer.start_agent(context);
-    }
-
-    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
-        self.renderer.finish_agent(context, stop_reason);
-    }
-
-    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
-        self.renderer.print_text(context, text);
-    }
-
-    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
-        self.renderer.print_thinking(context, text);
-    }
-
-    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
-        self.renderer.print_error(context, error);
-    }
-
-    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
-        self.renderer.print_info(context, info);
-    }
-
-    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
-        self.renderer.start_tool_use(context, name, id);
-    }
-
-    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
-        self.renderer.print_tool_input(context, partial_json);
-    }
-
-    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
-        self.renderer.finish_tool_use(context);
-    }
-
-    fn start_tool_result(
-        &mut self,
-        context: &dyn StreamContext,
-        tool_use_id: &str,
-        is_error: bool,
-    ) {
-        self.renderer
-            .start_tool_result(context, tool_use_id, is_error);
-    }
-
-    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
-        self.renderer.print_tool_result_text(context, text);
-    }
-
-    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
-        self.renderer.finish_tool_result(context);
-    }
-
-    fn finish_response(&mut self, context: &dyn StreamContext) {
-        self.renderer.finish_response(context);
-    }
-
-    fn print_interrupted(&mut self, context: &dyn StreamContext) {
-        self.renderer.print_interrupted(context);
-    }
-
-    fn should_interrupt(&self) -> bool {
-        self.renderer.should_interrupt()
-    }
-
-    fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
-        self.read_line(prompt).map(Some)
     }
 }
 
@@ -2007,48 +1606,18 @@ fn agent_state_dir() -> PathBuf {
     dir
 }
 
-/// Returns the transcript auto-save directory, creating it if necessary.
-fn transcript_dir() -> PathBuf {
-    let dir = agent_state_dir().join("sessions");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+fn default_transport_state_path() -> PathBuf {
+    agent_state_dir().join("cadence-agent-transport-state.json")
 }
 
-/// Generates a timestamped transcript path for auto-save.
-fn transcript_path() -> PathBuf {
-    let now = chrono::Local::now();
-    let filename = now.format("%Y-%m-%dT%H-%M-%S.json").to_string();
-    transcript_dir().join(filename)
+fn default_yaml_dir() -> PathBuf {
+    default_file_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(agent_state_dir)
 }
 
-/// Returns the readline history path for the interactive terminal.
-fn readline_history_path() -> PathBuf {
-    agent_state_dir().join("history.txt")
-}
-
-fn serialize_document(document: &CadenceDocument) -> Result<String, cadence_agent::Error> {
-    Ok(serde_yaml::to_string(document)?)
-}
-
-fn snapshot_document(document: &SharedDocument) -> Result<String, cadence_agent::Error> {
-    let doc = document.lock().unwrap();
-    serialize_document(&doc)
-}
-
-fn save_document_if_changed(
-    document: &SharedDocument,
-    file_path: &Path,
-    previous: &str,
-) -> Result<bool, cadence_agent::Error> {
-    let doc = document.lock().unwrap();
-    if serialize_document(&doc)? == previous {
-        return Ok(false);
-    }
-    save_document(file_path, &doc)?;
-    Ok(true)
-}
-
-fn timestamped_user_message_content(input: &str, timestamp: chrono::DateTime<Tz>) -> String {
+fn timestamped_user_message_content_at(input: &str, timestamp: chrono::DateTime<Tz>) -> String {
     format!(
         "Current timestamp: {} ({})\n\n{}",
         timestamp.to_rfc3339(),
@@ -2057,30 +1626,105 @@ fn timestamped_user_message_content(input: &str, timestamp: chrono::DateTime<Tz>
     )
 }
 
-fn create_timestamped_user_message(input: &str, document: &SharedDocument) -> MessageParam {
+fn timestamped_user_message_content(input: &str, document: &SharedDocument) -> String {
     let tz = {
         let doc = document.lock().unwrap();
         document_timezone(&doc).unwrap_or(Tz::UTC)
     };
     let now = chrono::Utc::now().with_timezone(&tz);
-    MessageParam::user(timestamped_user_message_content(input, now))
+    timestamped_user_message_content_at(input, now)
+}
+
+fn stamp_latest_user_message(messages: &mut [MessageParam], document: &SharedDocument) {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+    else {
+        return;
+    };
+    let MessageParamContent::String(text) = &mut message.content else {
+        return;
+    };
+    if text.starts_with("Current timestamp: ") {
+        return;
+    }
+    let raw = std::mem::take(text);
+    *text = timestamped_user_message_content(&raw, document);
+}
+
+fn user_yaml_path(yaml_dir: &Path, user_id: i64) -> PathBuf {
+    yaml_dir.join(format!("{user_id}.yaml"))
+}
+
+fn allowed_user_ids_from_yaml_dir(yaml_dir: &Path) -> Result<Vec<i64>, TelegramError> {
+    let mut ids = BTreeSet::new();
+    for entry in fs::read_dir(yaml_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+            continue;
+        }
+        if let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<i64>().ok())
+        {
+            ids.insert(id);
+        }
+    }
+    if ids.is_empty() {
+        // `claudius-telegram` treats an empty allow-list as allow-all.
+        ids.insert(i64::MIN);
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn user_yaml_pre_filter(
+    yaml_dir: PathBuf,
+    document: SharedDocument,
+    file_path: SharedFilePath,
+    fallback_user_id: Option<i64>,
+    require_existing: bool,
+) -> Box<dyn Fn(&Inbound) -> PreFilter + Send> {
+    Box::new(move |inbound| {
+        let Some(user_id) = inbound.from_user_id.or(fallback_user_id) else {
+            return PreFilter::handled_text("No Telegram user id was attached to this message.");
+        };
+        let path = user_yaml_path(&yaml_dir, user_id);
+        if require_existing && !path.is_file() {
+            return PreFilter::handled_text("");
+        }
+        match load_document(&path) {
+            Ok(loaded) => {
+                *document.lock().unwrap() = loaded;
+                *file_path.lock().unwrap() = path;
+                PreFilter::PassToAgent
+            }
+            Err(err) => PreFilter::handled_text(format!(
+                "Failed to load cadence file for user {user_id}: {err}"
+            )),
+        }
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (options, _free) = CliOptions::from_command_line_relaxed(
-        "Usage: cadence-agent [--file PATH] [--mutation-cap N]",
+        "Usage: cadence-agent [--yaml DIR] [--mutation-cap N] [--history-message-threshold N] [--stdin] [--state PATH]",
     );
 
-    let file_path = options
-        .file
+    let history_message_threshold = options
+        .history_message_threshold
+        .unwrap_or(DEFAULT_HISTORY_MESSAGE_THRESHOLD);
+    let yaml_dir = options
+        .yaml
         .map(PathBuf::from)
-        .unwrap_or_else(default_file_path);
-
-    let document: SharedDocument =
-        Arc::new(Mutex::new(load_document(&file_path).map_err(|e| {
-            format!("Failed to load {}: {e}", file_path.display())
-        })?));
+        .unwrap_or_else(default_yaml_dir);
+    std::fs::create_dir_all(&yaml_dir)?;
+    let initial_file_path = yaml_dir.join("0.yaml");
+    let document: SharedDocument = Arc::new(Mutex::new(CadenceDocument::new("UTC")));
+    let file_path: SharedFilePath = Arc::new(Mutex::new(initial_file_path));
 
     let client = Anthropic::new(None)?;
 
@@ -2094,104 +1738,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.mutation_cap.unwrap_or(DEFAULT_MUTATION_CAP),
     ));
 
-    let save_path = transcript_path();
     let config = ChatConfig::new()
         .with_model(Model::Custom("claude-haiku-4-5".to_string()))
-        .with_max_tokens(64000)
-        .with_caching(true)
-        .with_transcript_path(Some(save_path.clone()));
+        .with_max_tokens(1536)
+        .with_thinking_budget(Some(1024))
+        .with_caching(true);
 
     let agent = CadenceAgent::new(
         Arc::clone(&document),
         Arc::clone(&mutation_counter),
-        file_path.clone(),
+        Arc::clone(&file_path),
         config,
     );
 
-    let mut session = ChatSession::with_agent(client, agent);
-    let mut terminal = CadenceTerminal::new(interrupted.clone())?;
-    let context = ();
+    let state_path = options
+        .state
+        .map(PathBuf::from)
+        .unwrap_or_else(default_transport_state_path);
+    let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(state_path.clone()));
+    let loaded: TransportState = store.load().await?;
+    let state = Arc::new(AsyncMutex::new(loaded));
+    let budget = Arc::new(Budget::new_flat_rate(u64::MAX, 1));
 
-    println!("=== Cadence Agent ===");
-    println!("File: {}", file_path.display());
-    println!("Transcript: {}", save_path.display());
-    println!("Prompt caching: enabled (use /cache off to disable).");
-    println!("Chat with the assistant to manage your rhythms.");
-    println!("Type '/help' for commands.");
-    println!("Type 'quit' or 'exit' to end the session.");
-    println!("Press Ctrl+C to interrupt a response.\n");
+    eprintln!("[cadence-agent] yaml dir: {}", yaml_dir.display());
+    eprintln!("[cadence-agent] transport state: {}", state_path.display());
+    eprintln!("[cadence-agent] history message threshold: {history_message_threshold}");
 
-    loop {
-        interrupted.store(false, Ordering::Relaxed);
-
-        match terminal.read_line("> ") {
-            Ok(OperatorLine::Line(line)) => {
-                let input = line.trim();
-                if input.is_empty() {
-                    continue;
-                }
-
-                let input_lower = input.to_lowercase();
-                if input_lower == "quit" || input_lower == "exit" {
-                    println!("\nEnding session.");
-                    break;
-                }
-
-                if let Some(command) = parse_command(input) {
-                    let pre_command = snapshot_document(&document)?;
-                    let keep_going = handle_command(command, &document, &mut session)?;
-                    if let Err(err) = save_document_if_changed(&document, &file_path, &pre_command)
-                    {
-                        terminal.print_error(
-                            &context,
-                            &format!("Failed to auto-save {}: {err}", file_path.display()),
-                        );
-                    }
-                    if !keep_going {
-                        println!("\nEnding session.");
-                        break;
-                    }
-                    continue;
-                }
-
-                mutation_counter.reset();
-                let pre_turn = snapshot_document(&document)?;
-                let stats_before = session.stats();
-                let message = create_timestamped_user_message(input, &document);
-
-                println!("CadenceAgent:");
-                match session.send_message(message, &mut terminal).await {
-                    Ok(()) => {
-                        println!();
-                        let stats_after = session.stats();
-                        print_turn_usage(&stats_before, &stats_after);
-                    }
-                    Err(e) => {
-                        terminal.print_error(&context, &e.to_string());
-                        println!();
-                    }
-                }
-                if let Err(err) = save_document_if_changed(&document, &file_path, &pre_turn) {
-                    terminal.print_error(
-                        &context,
-                        &format!("Failed to auto-save {}: {err}", file_path.display()),
-                    );
-                }
-
-            }
-            Ok(OperatorLine::Interrupted) => {
-                println!();
-                continue;
-            }
-            Ok(OperatorLine::Eof) => {
-                println!("\nEnd of input. Exiting.");
-                break;
-            }
-            Err(err) => {
-                terminal.print_error(&context, &format!("Input error: {err}"));
-                break;
-            }
+    if options.stdin {
+        let transport = StdinTransport::new(Arc::clone(&interrupted));
+        let mut loop_config = LoopConfig::new(store, state, budget, interrupted);
+        loop_config.pre_filter = Some(user_yaml_pre_filter(
+            yaml_dir,
+            document,
+            file_path,
+            Some(0),
+            false,
+        ));
+        loop_config.max_history_messages = Some(history_message_threshold);
+        loop_config.reset_on_context_limit = true;
+        run_agent_loop(agent, transport, client, loop_config).await?;
+    } else {
+        let token = options
+            .token
+            .clone()
+            .or_else(|| env::var("TELEGRAM_BOT_TOKEN").ok())
+            .ok_or_else(|| {
+                TelegramError::Internal(
+                    "no token: pass --token, set TELEGRAM_BOT_TOKEN, or use --stdin".to_string(),
+                )
+            })?;
+        let mut transport =
+            TelegramTransport::new(token.clone(), Arc::clone(&state), Arc::clone(&store))?;
+        let allowed_user_ids = allowed_user_ids_from_yaml_dir(&yaml_dir)?;
+        let allowed_count = allowed_user_ids
+            .iter()
+            .filter(|&&id| id != i64::MIN)
+            .count();
+        transport = transport.with_allowed_user_ids(allowed_user_ids);
+        if let Some(secs) = options.poll_timeout {
+            transport = transport.with_poll_timeout(secs, token.clone())?;
         }
+        if options.delete_webhook_on_start {
+            transport.delete_webhook().await?;
+        }
+        match transport.get_me().await {
+            Ok(username) => eprintln!("[cadence-agent] connected as @{username}"),
+            Err(err) => eprintln!("[cadence-agent] getMe failed: {err}"),
+        }
+        eprintln!("[cadence-agent] allowed users: {allowed_count}");
+
+        let mut loop_config = LoopConfig::new(store, state, budget, interrupted);
+        loop_config.pre_filter = Some(user_yaml_pre_filter(
+            yaml_dir, document, file_path, None, true,
+        ));
+        loop_config.max_history_messages = Some(history_message_threshold);
+        loop_config.reset_on_context_limit = true;
+        run_agent_loop(agent, transport, client, loop_config).await?;
     }
 
     Ok(())
@@ -2202,30 +1824,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_cache_status_command() {
-        assert_eq!(parse_command("/cache"), Some(Command::Cache(None)));
-    }
-
-    #[test]
-    fn parse_cache_disable_command() {
-        assert_eq!(parse_command("/cache off"), Some(Command::Cache(Some(false))));
-    }
-
-    #[test]
-    fn parse_invalid_cache_command() {
-        assert!(matches!(
-            parse_command("/cache maybe"),
-            Some(Command::Invalid(message)) if message.contains("expects")
-        ));
-    }
-
-    #[test]
     fn timestamped_message_content_includes_timestamp_and_body() {
         let tz = Tz::UTC;
         let timestamp = chrono::TimeZone::with_ymd_and_hms(&tz, 2026, 5, 2, 12, 34, 56)
             .single()
             .expect("valid timestamp");
-        let content = timestamped_user_message_content("review my rhythms", timestamp);
+        let content = timestamped_user_message_content_at("review my rhythms", timestamp);
 
         assert!(content.contains("Current timestamp: 2026-05-02T12:34:56+00:00 (UTC)"));
         assert!(content.ends_with("\n\nreview my rhythms"));

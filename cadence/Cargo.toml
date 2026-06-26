@@ -12,12 +12,13 @@ name = "cadence-agent"
 path = "src/bin/cadence-agent.rs"
 
 [dependencies]
-arrrg = { workspace = true }
-arrrg_derive = { workspace = true }
+arrrg = "0.10.0"
+arrrg_derive = "0.10.0"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
-claudius = { workspace = true }
+claudius = "0.33.0"
+claudius-telegram = { path = "../../claudius/telegram" }
 crossterm = { workspace = true }
 ctrlc = { workspace = true }
 dirs = { workspace = true }

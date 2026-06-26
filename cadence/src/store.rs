@@ -125,6 +125,9 @@ impl CadenceDocument {
     pub fn load_or_default(path: &Path) -> Result<Self, Error> {
         if path.exists() {
             let contents = fs::read_to_string(path)?;
+            if contents.trim().is_empty() {
+                return Ok(Self::new(default_timezone_string()));
+            }
             let document: Self = serde_yaml::from_str(&contents)?;
             document.validate()?;
             Ok(document)
@@ -331,6 +334,22 @@ mod tests {
         let yaml = serde_yaml::to_string(&document).unwrap();
         let decoded: CadenceDocument = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(decoded, document);
+    }
+
+    #[test]
+    fn load_or_default_accepts_empty_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cadence-empty-{}-{}.yaml",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::write(&path, "").unwrap();
+
+        let document = CadenceDocument::load_or_default(&path).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(document.version, CURRENT_DOCUMENT_VERSION);
+        assert!(document.rhythms.is_empty());
     }
 
     #[test]
