@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::str::FromStr;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
@@ -335,6 +335,25 @@ pub struct RhythmManager {
     spoons: HashMap<NaiveDate, u8>,
 }
 
+fn scheduling_spoon_width(spoons: u8) -> usize {
+    usize::from(spoons.min(10)).max(1)
+}
+
+fn scheduling_day_capacity(watermark: usize) -> usize {
+    watermark.max(1)
+}
+
+fn raise_scheduling_watermarks(
+    watermarks: &mut HashMap<NaiveDate, usize>,
+    spoons: &HashMap<NaiveDate, u8>,
+    days: &[NaiveDate],
+) {
+    for day in days {
+        let width = scheduling_spoon_width(spoons.get(day).copied().unwrap_or(5));
+        *watermarks.entry(*day).or_insert(1) += width;
+    }
+}
+
 impl RhythmManager {
     pub fn new(
         user_id: Uuid,
@@ -477,7 +496,7 @@ impl RhythmManager {
         limit: NaiveDate,
         ignore_today: bool,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
-        self.schedule_internal(start, limit, ignore_today, &mut HashMap::default())
+        self.schedule_internal(start, limit, ignore_today)
     }
 
     fn schedule_internal(
@@ -485,69 +504,41 @@ impl RhythmManager {
         start: NaiveDate,
         limit: NaiveDate,
         ignore_today: bool,
-        watermarks: &mut HashMap<NaiveDate, usize>,
     ) -> Vec<(DateTime<Tz>, RhythmDefinition)> {
-        let mut events_by_rhythm: HashMap<RhythmID, Vec<&EventRecord>> = HashMap::new();
-        for event in &self.events {
-            events_by_rhythm
-                .entry(event.rhythm_id)
-                .or_default()
-                .push(event);
+        if start >= limit {
+            return Vec::new();
         }
+        let solve_limit = self
+            .rhythms
+            .iter()
+            .map(|rhythm| rhythm.rhythm.slider().before)
+            .max()
+            .and_then(|days| limit.checked_add_days(chrono::Days::new(days as u64)))
+            .unwrap_or(limit);
 
-        let today = self.now().date_naive();
-        let today_done_deferred_count = if ignore_today {
-            self.events
-                .iter()
-                .filter(|e| {
-                    e.local_time()
-                        .map(|dt| dt.date_naive() == today)
-                        .unwrap_or(false)
-                        && (e.event_type == EventType::Done || e.event_type == EventType::Defer)
-                })
-                .count()
-        } else {
-            0
-        };
-
-        let mut schedule: HashMap<NaiveDate, Vec<(DateTime<Tz>, RhythmDefinition)>> =
-            HashMap::new();
-
-        for rhythm in &self.rhythms {
-            if let Rhythm::Daily { at } = &rhythm.rhythm {
-                let mut day = start;
-                while day < limit {
-                    let has_done_or_defer = events_by_rhythm
-                        .get(&rhythm.id)
-                        .map(|events| {
-                            events.iter().any(|e| {
-                                e.local_time()
-                                    .map(|dt| dt.date_naive() == day)
-                                    .unwrap_or(false)
-                                    && (e.event_type == EventType::Done
-                                        || e.event_type == EventType::Defer)
-                            })
-                        })
-                        .unwrap_or(false);
-
-                    if !has_done_or_defer {
-                        let when = assign_time(day, *at, self.tz);
-                        schedule
-                            .entry(day)
-                            .or_default()
-                            .push((when, rhythm.clone()));
-                    }
-                    day += chrono::Duration::days(1);
-                }
-            }
+        #[derive(Default)]
+        struct RhythmEvents {
+            done_times: Vec<DateTime<Utc>>,
+            done_or_defer_dates: HashSet<NaiveDate>,
+            defer_dates: HashSet<NaiveDate>,
         }
 
         struct HeapItem {
-            rank: u64,
-            first_beat: DateTime<Tz>,
             rhythm: RhythmDefinition,
-            original_slider: Slider,
             original_beat: DateTime<Tz>,
+            options: Vec<NaiveDate>,
+            option_index: usize,
+            seq: u64,
+        }
+
+        impl HeapItem {
+            fn day(&self) -> NaiveDate {
+                self.options[self.option_index]
+            }
+
+            fn remaining_choices(&self) -> usize {
+                self.options.len() - self.option_index
+            }
         }
 
         impl Eq for HeapItem {}
@@ -560,9 +551,18 @@ impl RhythmManager {
 
         impl Ord for HeapItem {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.rank
-                    .cmp(&other.rank)
-                    .then(self.first_beat.cmp(&other.first_beat))
+                other
+                    .day()
+                    .cmp(&self.day())
+                    .then(
+                        self.rhythm
+                            .rhythm
+                            .approximate_periodicity()
+                            .cmp(&other.rhythm.rhythm.approximate_periodicity()),
+                    )
+                    .then(other.remaining_choices().cmp(&self.remaining_choices()))
+                    .then(other.rhythm.id.cmp(&self.rhythm.id))
+                    .then(other.seq.cmp(&self.seq))
             }
         }
 
@@ -572,135 +572,267 @@ impl RhythmManager {
             }
         }
 
-        let mut rank = u64::MAX;
-        let mut heap = BinaryHeap::new();
-        for rhythm in &self.rhythms {
-            if matches!(rhythm.rhythm, Rhythm::Daily { .. }) {
-                continue;
+        fn option_days(original_day: NaiveDate, slider: Slider) -> Vec<NaiveDate> {
+            let mut days = Vec::with_capacity(slider.before as usize + 1);
+            for offset in 0..=slider.before {
+                if let Some(day) = original_day.checked_sub_days(chrono::Days::new(offset as u64)) {
+                    days.push(day);
+                }
             }
-
-            let rhythm = rhythm.clone();
-            let done_events: Vec<DateTime<Utc>> = events_by_rhythm
-                .get(&rhythm.id)
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|e| e.event_type == EventType::Done)
-                        .map(|e| e.when)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let defer_dates: HashSet<NaiveDate> = events_by_rhythm
-                .get(&rhythm.id)
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|e| e.event_type == EventType::Defer)
-                        .filter_map(|e| e.local_time().ok().map(|dt| dt.date_naive()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let last_done = done_events
-                .iter()
-                .max()
-                .cloned()
-                .map(|dt| dt.with_timezone(&self.tz));
-            let start_dt = start
-                .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-                .and_local_timezone(self.tz)
-                .earliest()
-                .unwrap();
-
-            let mut first_beat = self.continuing_beat(&rhythm, start_dt, last_done);
-            while defer_dates.contains(&first_beat.date_naive()) {
-                first_beat = self.continuing_beat(&rhythm, first_beat, Some(first_beat));
-            }
-
-            let original_slider = rhythm.rhythm.slider();
-            let original_beat = first_beat;
-            heap.push(HeapItem {
-                rank,
-                first_beat,
-                rhythm,
-                original_slider,
-                original_beat,
-            });
-            rank -= original_slider.before as u64;
+            days
         }
 
-        while let Some(entry) = heap.pop() {
-            if entry.first_beat.date_naive() < start {
-                if entry.rhythm.rhythm.slider().before > 0 {
-                    heap.push(HeapItem {
-                        rank: entry.rank,
-                        first_beat: entry.first_beat - ONE_DAY,
-                        rhythm: entry.rhythm.slide_one(),
-                        original_slider: entry.original_slider,
-                        original_beat: entry.original_beat,
-                    });
+        fn in_window(day: NaiveDate, start: NaiveDate, limit: NaiveDate) -> bool {
+            start <= day && day < limit
+        }
+
+        fn first_window_option(
+            options: &[NaiveDate],
+            start: NaiveDate,
+            limit: NaiveDate,
+        ) -> Option<usize> {
+            options.iter().position(|day| in_window(*day, start, limit))
+        }
+
+        fn next_window_option(
+            options: &[NaiveDate],
+            option_index: usize,
+            start: NaiveDate,
+            limit: NaiveDate,
+        ) -> Option<usize> {
+            options
+                .iter()
+                .enumerate()
+                .skip(option_index + 1)
+                .find_map(|(index, day)| in_window(*day, start, limit).then_some(index))
+        }
+
+        fn push_beat(
+            heap: &mut BinaryHeap<HeapItem>,
+            seq: &mut u64,
+            rhythm: RhythmDefinition,
+            beat: DateTime<Tz>,
+            start: NaiveDate,
+            limit: NaiveDate,
+        ) {
+            let options = option_days(beat.date_naive(), rhythm.rhythm.slider());
+            if let Some(option_index) = first_window_option(&options, start, limit) {
+                heap.push(HeapItem {
+                    rhythm,
+                    original_beat: beat,
+                    options,
+                    option_index,
+                    seq: *seq,
+                });
+                *seq = seq.checked_add(1).expect("cadence scheduler seq overflow");
+            }
+        }
+
+        let mut events_by_rhythm: HashMap<RhythmID, RhythmEvents> = HashMap::new();
+        let today = self.now().date_naive();
+        let mut today_done_deferred_count = 0usize;
+        for event in &self.events {
+            let summary = events_by_rhythm.entry(event.rhythm_id).or_default();
+            if event.event_type == EventType::Done {
+                summary.done_times.push(event.when);
+            }
+            if let Ok(local_time) = event.local_time() {
+                let date = local_time.date_naive();
+                match event.event_type {
+                    EventType::Done => {
+                        summary.done_or_defer_dates.insert(date);
+                    }
+                    EventType::Defer => {
+                        summary.done_or_defer_dates.insert(date);
+                        summary.defer_dates.insert(date);
+                    }
+                }
+                if !ignore_today && date == today {
+                    today_done_deferred_count += 1;
+                }
+            }
+        }
+
+        let mut rhythms = self.rhythms.iter().collect::<Vec<_>>();
+        rhythms.sort_by_key(|rhythm| rhythm.id);
+
+        let mut schedule: BTreeMap<NaiveDate, Vec<(DateTime<Tz>, RhythmDefinition)>> =
+            BTreeMap::new();
+        let mut occupancy: HashMap<NaiveDate, usize> = HashMap::new();
+        let mut placed_rhythm_days: HashSet<(RhythmID, NaiveDate)> = HashSet::new();
+
+        for rhythm in &rhythms {
+            if let Rhythm::Daily { at } = rhythm.rhythm {
+                let mut day = start;
+                while day < solve_limit {
+                    let has_done_or_defer = events_by_rhythm
+                        .get(&rhythm.id)
+                        .map(|events| events.done_or_defer_dates.contains(&day))
+                        .unwrap_or(false);
+
+                    if !has_done_or_defer {
+                        let when = assign_time(day, at, self.tz);
+                        schedule
+                            .entry(day)
+                            .or_default()
+                            .push((when, (*rhythm).clone()));
+                        *occupancy.entry(day).or_default() += 1;
+                        placed_rhythm_days.insert((rhythm.id, day));
+                    }
+                    day += chrono::Duration::days(1);
+                }
+            }
+        }
+
+        let start_dt = start
+            .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+            .and_local_timezone(self.tz)
+            .earliest()
+            .unwrap();
+        let mut seq = 0u64;
+        let mut heap = BinaryHeap::new();
+
+        for rhythm in rhythms
+            .iter()
+            .filter(|rhythm| !matches!(rhythm.rhythm, Rhythm::Daily { .. }))
+        {
+            let last_done = events_by_rhythm
+                .get(&rhythm.id)
+                .and_then(|events| events.done_times.iter().max().copied())
+                .map(|dt| dt.with_timezone(&self.tz));
+
+            let mut first_beat = self.continuing_beat(rhythm, start_dt, last_done);
+            while events_by_rhythm
+                .get(&rhythm.id)
+                .map(|events| events.defer_dates.contains(&first_beat.date_naive()))
+                .unwrap_or(false)
+            {
+                first_beat = self.continuing_beat(rhythm, first_beat.clone(), Some(first_beat));
+            }
+
+            push_beat(
+                &mut heap,
+                &mut seq,
+                (*rhythm).clone(),
+                first_beat,
+                start,
+                solve_limit,
+            );
+        }
+
+        let mut watermarks: HashMap<NaiveDate, usize> = HashMap::new();
+        let mut iterations = 0usize;
+        while let Some(mut entry) = heap.pop() {
+            iterations += 1;
+            assert!(
+                iterations <= 200_000,
+                "cadence scheduler exceeded iteration guard"
+            );
+
+            let day = entry.day();
+            let deferred_today = events_by_rhythm
+                .get(&entry.rhythm.id)
+                .map(|events| events.defer_dates.contains(&day))
+                .unwrap_or(false);
+            let already_placed_today = placed_rhythm_days.contains(&(entry.rhythm.id, day));
+
+            if deferred_today || already_placed_today {
+                if let Some(next_index) =
+                    next_window_option(&entry.options, entry.option_index, start, solve_limit)
+                {
+                    entry.option_index = next_index;
+                    entry.seq = seq;
+                    seq = seq.checked_add(1).expect("cadence scheduler seq overflow");
+                    heap.push(entry);
+                } else {
+                    let mut next_beat = self.continuing_beat(
+                        &entry.rhythm,
+                        entry.original_beat.clone(),
+                        Some(entry.original_beat),
+                    );
+                    while events_by_rhythm
+                        .get(&entry.rhythm.id)
+                        .map(|events| events.defer_dates.contains(&next_beat.date_naive()))
+                        .unwrap_or(false)
+                    {
+                        next_beat =
+                            self.continuing_beat(&entry.rhythm, next_beat.clone(), Some(next_beat));
+                    }
+                    push_beat(
+                        &mut heap,
+                        &mut seq,
+                        entry.rhythm,
+                        next_beat,
+                        start,
+                        solve_limit,
+                    );
                 }
                 continue;
             }
-            if (entry.first_beat - ONE_DAY * entry.rhythm.rhythm.slider().before).date_naive()
-                >= limit
-            {
-                continue;
-            }
-            let slots_per_day = watermarks
-                .get(&entry.first_beat.date_naive())
-                .copied()
-                .unwrap_or(1);
-            let spoons_today = self
-                .spoons
-                .get(&entry.first_beat.date_naive())
-                .copied()
-                .unwrap_or(5);
-            let spoons_adjusted = (spoons_today as i32 - 5).clamp(-5, 5);
-            let slots_per_day =
-                ((slots_per_day as f64) * 2_f64.powf(spoons_adjusted as f64 / 5.0)).ceil() as usize;
-            let slots_per_day = if entry.first_beat.date_naive() == today && !ignore_today {
+
+            let slots_per_day = scheduling_day_capacity(watermarks.get(&day).copied().unwrap_or(1));
+            let slots_per_day = if !ignore_today && day == today {
                 slots_per_day.saturating_sub(today_done_deferred_count)
             } else {
                 slots_per_day
-            };
-            let slots_per_day = slots_per_day.max(1);
-            let slots = schedule.entry(entry.first_beat.date_naive()).or_default();
-            let defer_today = self.events.iter().any(|e| {
-                e.rhythm_id == entry.rhythm.id
-                    && e.event_type == EventType::Defer
-                    && e.local_time()
-                        .map(|dt| dt.date_naive() == entry.first_beat.date_naive())
-                        .unwrap_or(false)
-            });
-            if !defer_today && slots.len() < slots_per_day {
-                slots.push((entry.first_beat, entry.rhythm.clone()));
-                let next_beat =
-                    self.continuing_beat(&entry.rhythm, entry.first_beat, Some(entry.first_beat));
-                heap.push(HeapItem {
-                    rank: entry.rank,
-                    first_beat: next_beat,
-                    rhythm: entry.rhythm.with_slider(entry.original_slider),
-                    original_slider: entry.original_slider,
-                    original_beat: next_beat,
-                });
-            } else {
-                let low_water_mark = watermarks
-                    .get(&entry.first_beat.date_naive())
-                    .cloned()
-                    .unwrap_or(0)
-                    + 1;
-                for idx in 0..=entry.original_slider.before {
-                    let date = (entry.original_beat - ONE_DAY * idx).date_naive();
-                    let current = watermarks.entry(date).or_default();
-                    *current = (*current).max(low_water_mark);
+            }
+            .max(1);
+
+            if occupancy.get(&day).copied().unwrap_or(0) < slots_per_day {
+                let when = assign_time(day, entry.rhythm.rhythm.at(), self.tz);
+                schedule
+                    .entry(day)
+                    .or_default()
+                    .push((when, entry.rhythm.clone()));
+                *occupancy.entry(day).or_default() += 1;
+                placed_rhythm_days.insert((entry.rhythm.id, day));
+
+                let mut next_beat = self.continuing_beat(
+                    &entry.rhythm,
+                    entry.original_beat.clone(),
+                    Some(entry.original_beat),
+                );
+                while events_by_rhythm
+                    .get(&entry.rhythm.id)
+                    .map(|events| events.defer_dates.contains(&next_beat.date_naive()))
+                    .unwrap_or(false)
+                {
+                    next_beat =
+                        self.continuing_beat(&entry.rhythm, next_beat.clone(), Some(next_beat));
                 }
-                return self.schedule_internal(start, limit, ignore_today, watermarks);
+                push_beat(
+                    &mut heap,
+                    &mut seq,
+                    entry.rhythm,
+                    next_beat,
+                    start,
+                    solve_limit,
+                );
+            } else if let Some(next_index) =
+                next_window_option(&entry.options, entry.option_index, start, solve_limit)
+            {
+                entry.option_index = next_index;
+                entry.seq = seq;
+                seq = seq.checked_add(1).expect("cadence scheduler seq overflow");
+                heap.push(entry);
+            } else {
+                raise_scheduling_watermarks(&mut watermarks, &self.spoons, &entry.options);
+                if let Some(first_index) = first_window_option(&entry.options, start, solve_limit) {
+                    entry.option_index = first_index;
+                }
+                entry.seq = seq;
+                seq = seq.checked_add(1).expect("cadence scheduler seq overflow");
+                heap.push(entry);
             }
         }
-        let mut result = schedule.values().flatten().cloned().collect::<Vec<_>>();
-        result.sort_by_key(|x| x.0);
+
+        let mut result = schedule
+            .values()
+            .flatten()
+            .filter(|(datetime, _)| in_window(datetime.date_naive(), start, limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.id.cmp(&right.1.id)));
         result
     }
 
@@ -1213,6 +1345,119 @@ mod tests {
                 .push(rhythm);
         }
         grouped
+    }
+
+    #[test]
+    fn watermark_raise_scales_with_spoons() {
+        let saturday = NaiveDate::from_ymd_opt(2026, 6, 27).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 6, 28).unwrap();
+        let mut watermarks = HashMap::new();
+        let spoons = HashMap::from([(saturday, 1)]);
+
+        raise_scheduling_watermarks(&mut watermarks, &spoons, &[saturday, sunday]);
+
+        assert_eq!(watermarks.get(&saturday).copied(), Some(2));
+        assert_eq!(watermarks.get(&sunday).copied(), Some(6));
+        assert_eq!(
+            scheduling_day_capacity(watermarks[&saturday]),
+            2,
+            "1-spoon Saturday should gain one slot"
+        );
+        assert_eq!(
+            scheduling_day_capacity(watermarks[&sunday]),
+            6,
+            "default 5-spoon Sunday should gain five slots"
+        );
+    }
+
+    #[test]
+    fn proportional_widening_prefers_default_spoon_target_over_low_spoon_slider_day() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let saturday = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2023, 8, 20).unwrap();
+
+        manager.spoons(saturday, 1);
+
+        for i in 0..3 {
+            manager
+                .set_rhythm(create_test_rhythm(
+                    &format!("capacity_daily_{i}"),
+                    Rhythm::Daily { at: TEST_AT },
+                ))
+                .unwrap();
+        }
+
+        let mut sunday_rhythm_ids = HashSet::new();
+        for i in 0..3 {
+            let rhythm = create_test_rhythm(
+                &format!("sunday_slider_{i}"),
+                Rhythm::WeekDaily {
+                    dotw: 6,
+                    at: TEST_AT,
+                    slider: Slider::new(1),
+                },
+            );
+            sunday_rhythm_ids.insert(rhythm.id);
+            manager.set_rhythm(rhythm).unwrap();
+        }
+
+        let schedule = manager.schedule(saturday, sunday + chrono::Duration::days(1));
+        let saturday_slid_count = schedule
+            .iter()
+            .filter(|(dt, rhythm)| {
+                dt.date_naive() == saturday && sunday_rhythm_ids.contains(&rhythm.id)
+            })
+            .count();
+        let sunday_target_count = schedule
+            .iter()
+            .filter(|(dt, rhythm)| {
+                dt.date_naive() == sunday && sunday_rhythm_ids.contains(&rhythm.id)
+            })
+            .count();
+
+        assert_eq!(
+            saturday_slid_count, 0,
+            "Sunday-targeted work should not flow back onto a 1-spoon Saturday"
+        );
+        assert_eq!(sunday_target_count, sunday_rhythm_ids.len());
+    }
+
+    #[test]
+    fn short_range_does_not_pull_tail_slider_work_onto_last_day() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let friday = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
+        let saturday = NaiveDate::from_ymd_opt(2026, 6, 27).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 6, 28).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 6, 29).unwrap();
+
+        let sunday_rhythm = create_test_rhythm(
+            "sunday_slider",
+            Rhythm::WeekDaily {
+                dotw: 6,
+                at: TEST_AT,
+                slider: Slider::new(1),
+            },
+        );
+        let sunday_rhythm_id = sunday_rhythm.id;
+        manager.set_rhythm(sunday_rhythm).unwrap();
+
+        let short = manager.schedule(friday, sunday);
+        let long = manager.schedule(friday, monday);
+
+        let short_saturday_count = short
+            .iter()
+            .filter(|(dt, rhythm)| dt.date_naive() == saturday && rhythm.id == sunday_rhythm_id)
+            .count();
+        let long_saturday_count = long
+            .iter()
+            .filter(|(dt, rhythm)| dt.date_naive() == saturday && rhythm.id == sunday_rhythm_id)
+            .count();
+
+        assert_eq!(short_saturday_count, long_saturday_count);
+        assert_eq!(
+            short_saturday_count, 0,
+            "Sunday work should not appear on Saturday only because Sunday is outside the range"
+        );
     }
 
     #[test]
@@ -1978,6 +2223,199 @@ mod tests {
             total_scheduled >= 5 * 3,
             "All 5 rhythms should fire at least 3 times over 7 days (every 2 days). Got {total_scheduled}"
         );
+    }
+
+    #[test]
+    fn rigid_monthly_pileup_terminates_without_restart() {
+        for count in [5, 10, 20, 40, 80] {
+            let mut manager = create_test_manager("America/Los_Angeles");
+            for i in 0..count {
+                let rhythm = create_test_rhythm(
+                    &format!("rigid_monthly_{count}_{i}"),
+                    Rhythm::Monthly {
+                        dotm: 14,
+                        at: TEST_AT,
+                        slider: Slider::default(),
+                    },
+                );
+                manager.set_rhythm(rhythm).unwrap();
+            }
+
+            let start = NaiveDate::from_ymd_opt(2023, 8, 1).unwrap();
+            let limit = NaiveDate::from_ymd_opt(2023, 10, 1).unwrap();
+            let schedule = manager.schedule(start, limit);
+            let aug_15_count = schedule
+                .iter()
+                .filter(|(dt, _)| dt.date_naive() == NaiveDate::from_ymd_opt(2023, 8, 15).unwrap())
+                .count();
+            let sep_15_count = schedule
+                .iter()
+                .filter(|(dt, _)| dt.date_naive() == NaiveDate::from_ymd_opt(2023, 9, 15).unwrap())
+                .count();
+
+            assert_eq!(aug_15_count, count);
+            assert_eq!(sep_15_count, count);
+        }
+    }
+
+    #[test]
+    fn schedule_repeat_solve_is_identical() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        for i in 0..4 {
+            manager
+                .set_rhythm(create_test_rhythm(
+                    &format!("det_daily_{i}"),
+                    Rhythm::Daily { at: TEST_AT },
+                ))
+                .unwrap();
+            manager
+                .set_rhythm(create_test_rhythm(
+                    &format!("det_weekly_{i}"),
+                    Rhythm::WeekDaily {
+                        dotw: 1,
+                        at: TEST_AT,
+                        slider: Slider::new(2),
+                    },
+                ))
+                .unwrap();
+            manager
+                .set_rhythm(create_test_rhythm(
+                    &format!("det_monthly_{i}"),
+                    Rhythm::Monthly {
+                        dotm: 14,
+                        at: TEST_AT,
+                        slider: Slider::new(2),
+                    },
+                ))
+                .unwrap();
+        }
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 1).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 9, 1).unwrap();
+
+        assert_eq!(
+            manager.schedule(start, limit),
+            manager.schedule(start, limit)
+        );
+    }
+
+    #[test]
+    fn higher_periodicity_wins_contested_target_day() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let weekly = create_test_rhythm(
+            "tie_weekly",
+            Rhythm::WeekDaily {
+                dotw: 1,
+                at: TEST_AT,
+                slider: Slider::new(1),
+            },
+        );
+        let monthly = create_test_rhythm(
+            "tie_monthly",
+            Rhythm::Monthly {
+                dotm: 14,
+                at: TEST_AT,
+                slider: Slider::default(),
+            },
+        );
+
+        manager.set_rhythm(weekly.clone()).unwrap();
+        manager.set_rhythm(monthly.clone()).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 14).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 16).unwrap();
+        let schedule = manager.schedule(start, limit);
+        let weekly_day = schedule
+            .iter()
+            .find(|(_, rhythm)| rhythm.id == weekly.id)
+            .map(|(dt, _)| dt.date_naive())
+            .unwrap();
+        let monthly_day = schedule
+            .iter()
+            .find(|(_, rhythm)| rhythm.id == monthly.id)
+            .map(|(dt, _)| dt.date_naive())
+            .unwrap();
+
+        assert_eq!(weekly_day, NaiveDate::from_ymd_opt(2023, 8, 14).unwrap());
+        assert_eq!(monthly_day, NaiveDate::from_ymd_opt(2023, 8, 15).unwrap());
+    }
+
+    #[test]
+    fn slider_never_places_outside_requested_window() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let monthly = create_test_rhythm(
+            "window_slider",
+            Rhythm::Monthly {
+                dotm: 14,
+                at: TEST_AT,
+                slider: Slider::new(5),
+            },
+        );
+        manager.set_rhythm(monthly.clone()).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 10).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 14).unwrap();
+        let schedule = manager.schedule(start, limit);
+
+        assert!(schedule.is_empty());
+    }
+
+    #[test]
+    fn tail_lookahead_keeps_future_beat_outside_window() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let every2 = create_test_rhythm(
+            "window_end_every2",
+            Rhythm::EveryNDays {
+                n: 2,
+                at: TEST_AT,
+                slider: Slider::new(2),
+            },
+        );
+        manager.set_rhythm(every2.clone()).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 14).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 23).unwrap();
+        let schedule = manager.schedule(start, limit);
+        let placements = schedule
+            .iter()
+            .filter(|(_, rhythm)| rhythm.id == every2.id)
+            .map(|(dt, _)| dt.date_naive())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            placements,
+            vec![
+                NaiveDate::from_ymd_opt(2023, 8, 15).unwrap(),
+                NaiveDate::from_ymd_opt(2023, 8, 17).unwrap(),
+                NaiveDate::from_ymd_opt(2023, 8, 19).unwrap(),
+                NaiveDate::from_ymd_opt(2023, 8, 21).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn slid_future_beat_does_not_duplicate_same_rhythm_day() {
+        let mut manager = create_test_manager("America/Los_Angeles");
+        let every2 = create_test_rhythm(
+            "duplicate_window_end_every2",
+            Rhythm::EveryNDays {
+                n: 2,
+                at: TEST_AT,
+                slider: Slider::new(2),
+            },
+        );
+        manager.set_rhythm(every2.clone()).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2023, 8, 18).unwrap();
+        let limit = NaiveDate::from_ymd_opt(2023, 8, 19).unwrap();
+        let placements = manager
+            .schedule(start, limit)
+            .iter()
+            .filter(|(_, rhythm)| rhythm.id == every2.id)
+            .map(|(dt, _)| dt.date_naive())
+            .collect::<Vec<_>>();
+
+        assert_eq!(placements, vec![start]);
     }
 
     #[test]
