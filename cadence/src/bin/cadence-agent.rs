@@ -4,7 +4,7 @@
 //! habits. The conversation operates on a YAML cadence document and is driven by the durable
 //! transport loop from `claudius-telegram`.
 //!
-//! Usage: `cadence-agent [--yaml DIR] [--stdin]`
+//! Usage: `cadence-agent [--yaml DIR] [--model MODEL] [--import-request-log PATH] [--stdin]`
 //!
 //! Telegram mode reads `--token` or `TELEGRAM_BOT_TOKEN`; either may be a raw bot
 //! token or `file://PATH`.
@@ -13,6 +13,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use claudius::Agent;
 use claudius::AgentStreamContext;
 use claudius::Anthropic;
 use claudius::Budget;
+use claudius::Content;
 use claudius::ContentBlock;
 use claudius::IntermediateToolResult;
 use claudius::Message;
@@ -59,7 +61,7 @@ use claudius_telegram::{
     Error as TelegramError, FileStateStore, Inbound, LoopConfig, PreFilter, StateStore,
     StdinTransport, TelegramTransport, TransportState, run_agent_loop,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../prompts/default-system.md");
@@ -70,6 +72,18 @@ const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../prompts/default-system.m
 struct CliOptions {
     #[arrrg(optional, "Directory containing per-user YAML files", "DIR")]
     yaml: Option<String>,
+    #[arrrg(
+        optional,
+        "Anthropic model to use [default: claude-haiku-4-5]",
+        "MODEL"
+    )]
+    model: Option<String>,
+    #[arrrg(
+        optional,
+        "Import compact request logs from a transport state JSON and exit",
+        "PATH"
+    )]
+    import_request_log: Option<String>,
     #[arrrg(optional, "Override the default mutation cap per turn", "N")]
     mutation_cap: Option<usize>,
     #[arrrg(flag, "Use stdin/stdout transport instead of Telegram")]
@@ -102,6 +116,12 @@ type SharedFilePath = Arc<Mutex<PathBuf>>;
 
 /// Maximum number of mutation tool calls allowed per agent turn.
 const DEFAULT_MUTATION_CAP: usize = 20;
+
+/// Default Anthropic model for the cadence agent.
+const DEFAULT_MODEL: &str = "claude-haiku-4-5";
+
+/// Request-log JSONL schema emitted beside each per-user YAML file.
+const REQUEST_LOG_SCHEMA: &str = "cadence.request_log.v1";
 
 /// Maximum persisted chat messages to send back to the model before resetting history.
 const DEFAULT_HISTORY_MESSAGE_THRESHOLD: usize = 40;
@@ -213,8 +233,33 @@ impl Agent for CadenceAgent {
     ) -> Result<TurnOutcome, claudius::Error> {
         self.mutation_counter.reset();
         stamp_latest_user_message(messages, &self.document);
-        self.take_default_turn_streaming(client, messages, budget, renderer, context)
-            .await
+        let turn_start = latest_human_user_message_index(messages);
+        let result = self
+            .take_default_turn_streaming(client, messages, budget, renderer, context)
+            .await;
+        if let Ok(outcome) = &result
+            && outcome.stop_reason != StopReason::ModelContextWindowExceeded
+            && let Some(turn_start) = turn_start
+        {
+            let yaml_path = self.file_path.lock().unwrap().clone();
+            if let Some(entry) = build_request_log_entry(
+                "live",
+                chat_id_from_yaml_path(&yaml_path),
+                &yaml_path,
+                None,
+                &self.config.model(),
+                false,
+                None,
+                &messages[turn_start..],
+            ) && let Err(err) = append_request_log_entry(&yaml_path, &entry)
+            {
+                eprintln!(
+                    "[cadence-agent] failed to append request log for {}: {err}",
+                    yaml_path.display()
+                );
+            }
+        }
+        result
     }
 
     async fn tools(&self) -> Vec<Arc<dyn Tool<Self>>> {
@@ -1653,6 +1698,285 @@ fn stamp_latest_user_message(messages: &mut [MessageParam], document: &SharedDoc
     *text = timestamped_user_message_content(&raw, document);
 }
 
+fn is_human_user_message(message: &MessageParam) -> bool {
+    message.role == MessageRole::User && matches!(message.content, MessageParamContent::String(_))
+}
+
+fn latest_human_user_message_index(messages: &[MessageParam]) -> Option<usize> {
+    messages.iter().rposition(is_human_user_message)
+}
+
+fn split_timestamped_user_text(input: &str) -> (Option<String>, Option<String>, String) {
+    let Some(rest) = input.strip_prefix("Current timestamp: ") else {
+        return (None, None, input.to_string());
+    };
+    let Some((header, text)) = rest.split_once("\n\n") else {
+        return (None, None, input.to_string());
+    };
+    let (timestamp, timezone) = if let Some((timestamp, tz)) = header.split_once(" (") {
+        (
+            Some(timestamp.to_string()),
+            tz.strip_suffix(')').map(str::to_string),
+        )
+    } else {
+        (Some(header.to_string()), None)
+    };
+    (timestamp, timezone, text.to_string())
+}
+
+fn request_log_path(yaml_path: &Path) -> PathBuf {
+    yaml_path.with_extension("jsonl")
+}
+
+fn chat_id_from_yaml_path(yaml_path: &Path) -> Option<i64> {
+    yaml_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<i64>().ok())
+}
+
+fn content_items_to_text(items: &[Content]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Content::Text(text) => Some(text.text.as_str()),
+            Content::Image(_) => Some("[image]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_result_summary(block: &ToolResultBlock) -> Value {
+    let text = match &block.content {
+        Some(ToolResultBlockContent::String(text)) => text.clone(),
+        Some(ToolResultBlockContent::Array(items)) => content_items_to_text(items),
+        None => String::new(),
+    };
+    json!({
+        "is_error": block.is_error.unwrap_or(false),
+        "content": serde_json::to_value(&block.content).unwrap_or(Value::Null),
+        "content_text": text,
+    })
+}
+
+fn attach_tool_result(tools: &mut Vec<Value>, tool_use_id: &str, result: Value) {
+    for tool in tools.iter_mut().rev() {
+        if tool
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == tool_use_id)
+        {
+            if let Some(obj) = tool.as_object_mut() {
+                obj.insert("result".to_string(), result);
+            }
+            return;
+        }
+    }
+    tools.push(json!({
+        "id": tool_use_id,
+        "result": result,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_log_entry(
+    source: &str,
+    chat_id: Option<i64>,
+    yaml_path: &Path,
+    turn_id: Option<&str>,
+    model: &Model,
+    imported: bool,
+    import_source: Option<&Path>,
+    messages: &[MessageParam],
+) -> Option<Value> {
+    let user_message = messages
+        .iter()
+        .find(|message| is_human_user_message(message))?;
+    let MessageParamContent::String(raw_user_text) = &user_message.content else {
+        return None;
+    };
+    let (timestamp, timezone, user_text) = split_timestamped_user_text(raw_user_text);
+    let mut assistant_text = Vec::new();
+    let mut tools = Vec::new();
+    let mut skipped_blocks = BTreeSet::new();
+
+    for message in messages {
+        match &message.content {
+            MessageParamContent::String(text) if message.role == MessageRole::Assistant => {
+                assistant_text.push(text.clone());
+            }
+            MessageParamContent::String(_) => {}
+            MessageParamContent::Array(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text(text) if message.role == MessageRole::Assistant => {
+                            assistant_text.push(text.text.clone());
+                        }
+                        ContentBlock::ToolUse(tool_use) => {
+                            tools.push(json!({
+                                "id": tool_use.id,
+                                "name": tool_use.name,
+                                "input": tool_use.input,
+                            }));
+                        }
+                        ContentBlock::ToolResult(tool_result) => {
+                            attach_tool_result(
+                                &mut tools,
+                                &tool_result.tool_use_id,
+                                tool_result_summary(tool_result),
+                            );
+                        }
+                        ContentBlock::Text(_) => {
+                            skipped_blocks.insert("non_assistant_text");
+                        }
+                        ContentBlock::Thinking(_) => {
+                            skipped_blocks.insert("thinking");
+                        }
+                        ContentBlock::RedactedThinking(_) => {
+                            skipped_blocks.insert("redacted_thinking");
+                        }
+                        ContentBlock::Image(_) => {
+                            skipped_blocks.insert("image");
+                        }
+                        ContentBlock::ServerToolUse(_) => {
+                            skipped_blocks.insert("server_tool_use");
+                        }
+                        ContentBlock::WebSearchToolResult(_) => {
+                            skipped_blocks.insert("web_search_tool_result");
+                        }
+                        ContentBlock::Document(_) => {
+                            skipped_blocks.insert("document");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let generated_turn_id;
+    let turn_id = match turn_id {
+        Some(turn_id) => turn_id,
+        None => {
+            generated_turn_id = format!("live:{}", chrono::Utc::now().timestamp_micros());
+            &generated_turn_id
+        }
+    };
+    let messages_value = serde_json::to_value(messages).unwrap_or(Value::Null);
+
+    let mut entry = json!({
+        "schema": REQUEST_LOG_SCHEMA,
+        "turn_id": turn_id,
+        "source": source,
+        "imported": imported,
+        "recorded_at": chrono::Utc::now().to_rfc3339(),
+        "timestamp": timestamp,
+        "timezone": timezone,
+        "chat_id": chat_id,
+        "yaml_path": yaml_path.to_string_lossy(),
+        "model": model.to_string(),
+        "message_count": messages.len(),
+        "messages": messages_value,
+        "user_text": user_text,
+        "assistant_text": assistant_text.join("\n"),
+        "tools": tools,
+        "skipped_blocks": skipped_blocks.into_iter().collect::<Vec<_>>(),
+    });
+    if let Some(import_source) = import_source
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.insert(
+            "import_source".to_string(),
+            Value::String(import_source.to_string_lossy().to_string()),
+        );
+    }
+    Some(entry)
+}
+
+fn append_request_log_entry(yaml_path: &Path, entry: &Value) -> io::Result<()> {
+    let log_path = request_log_path(yaml_path);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let line = serde_json::to_string(entry)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    writeln!(file, "{line}")
+}
+
+fn existing_request_log_turn_ids(log_path: &Path) -> io::Result<BTreeSet<String>> {
+    let text = match fs::read_to_string(log_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(err) => return Err(err),
+    };
+    let mut ids = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("schema").and_then(Value::as_str) == Some(REQUEST_LOG_SCHEMA)
+            && let Some(turn_id) = value.get("turn_id").and_then(Value::as_str)
+        {
+            ids.insert(turn_id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn import_request_logs_from_state(
+    state_path: &Path,
+    yaml_dir: &Path,
+    model: &Model,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let bytes = fs::read(state_path)?;
+    let state: TransportState = serde_json::from_slice(&bytes)?;
+    let mut imported = 0usize;
+
+    for (chat_id, messages) in &state.conversations {
+        let yaml_path = user_yaml_path(yaml_dir, *chat_id);
+        let log_path = request_log_path(&yaml_path);
+        let mut existing = existing_request_log_turn_ids(&log_path)?;
+        let mut turn_start = None;
+        let mut turn_index = 0usize;
+
+        for index in 0..=messages.len() {
+            let starts_next_turn =
+                index < messages.len() && is_human_user_message(&messages[index]);
+            if (starts_next_turn || index == messages.len())
+                && let Some(start) = turn_start
+            {
+                let turn_id = format!("state:{chat_id}:{turn_index}");
+                if !existing.contains(&turn_id)
+                    && let Some(entry) = build_request_log_entry(
+                        "import",
+                        Some(*chat_id),
+                        &yaml_path,
+                        Some(&turn_id),
+                        model,
+                        true,
+                        Some(state_path),
+                        &messages[start..index],
+                    )
+                {
+                    append_request_log_entry(&yaml_path, &entry)?;
+                    existing.insert(turn_id);
+                    imported += 1;
+                }
+                turn_index += 1;
+                turn_start = None;
+            }
+            if starts_next_turn {
+                turn_start = Some(index);
+            }
+        }
+    }
+
+    Ok(imported)
+}
+
 fn user_yaml_path(yaml_dir: &Path, user_id: i64) -> PathBuf {
     yaml_dir.join(format!("{user_id}.yaml"))
 }
@@ -1711,7 +2035,7 @@ fn user_yaml_pre_filter(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (options, _free) = CliOptions::from_command_line_relaxed(
-        "Usage: cadence-agent [--yaml DIR] [--mutation-cap N] [--history-message-threshold N] [--stdin] [--state PATH]",
+        "Usage: cadence-agent [--yaml DIR] [--model MODEL] [--import-request-log PATH] [--mutation-cap N] [--history-message-threshold N] [--stdin] [--state PATH]",
     );
 
     let history_message_threshold = options
@@ -1722,6 +2046,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(default_yaml_dir);
     std::fs::create_dir_all(&yaml_dir)?;
+
+    let model_name = options.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let model = model_name
+        .parse::<Model>()
+        .unwrap_or_else(|_| Model::Custom(model_name.to_string()));
+
+    if let Some(import_request_log) = options.import_request_log.as_deref() {
+        let imported =
+            import_request_logs_from_state(Path::new(import_request_log), &yaml_dir, &model)?;
+        println!("imported {imported} request log entries");
+        return Ok(());
+    }
+
     let initial_file_path = yaml_dir.join("0.yaml");
     let document: SharedDocument = Arc::new(Mutex::new(CadenceDocument::new("UTC")));
     let file_path: SharedFilePath = Arc::new(Mutex::new(initial_file_path));
@@ -1739,7 +2076,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let config = ChatConfig::new()
-        .with_model(Model::Custom("claude-haiku-4-5".to_string()))
+        .with_model(model.clone())
         .with_max_tokens(1536)
         .with_thinking_budget(Some(1024))
         .with_caching(true);
@@ -1762,6 +2099,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[cadence-agent] yaml dir: {}", yaml_dir.display());
     eprintln!("[cadence-agent] transport state: {}", state_path.display());
+    eprintln!("[cadence-agent] model: {model}");
     eprintln!("[cadence-agent] history message threshold: {history_message_threshold}");
 
     if options.stdin {
