@@ -8,17 +8,20 @@ mod rhythm;
 pub mod store;
 
 pub use app::{
-    RhythmInput, RhythmKind, RhythmUpdate, TodayRenderOptions, add_rhythm, build_rhythm,
-    convergence_response, default_file_path, defer_rhythm, defer_rhythm_at, delete_rhythm,
-    delinquent_items, document_timezone, format_rhythm, list_rhythms, load_document,
-    mark_rhythm_done, mark_rhythm_done_at, parse_date, parse_rhythm_id, parse_time,
-    render_delinquent_items, render_schedule_items, render_today_items, rhythm_kind_name,
-    save_document, schedule_items, set_spoons, today_items, update_rhythm,
+    PROACTIVE_CHECK_IN_HISTORY_LIMIT, ProactiveCheckInPlan, ProactiveDueGroup, RhythmInput,
+    RhythmKind, RhythmUpdate, TodayRenderOptions, add_rhythm, build_rhythm, convergence_response,
+    default_file_path, defer_rhythm, defer_rhythm_at, delete_rhythm, delinquent_items,
+    document_timezone, format_rhythm, list_rhythms, load_document, mark_rhythm_done,
+    mark_rhythm_done_at, next_proactive_due_at_after, parse_date, parse_rhythm_id, parse_time,
+    plan_scheduled_proactive_check_in, plan_startup_proactive_check_in, proactive_due_groups,
+    record_proactive_check_in_plan, render_delinquent_items, render_schedule_items,
+    render_today_items, rhythm_kind_name, save_document, schedule_items, set_spoons, today_items,
+    update_rhythm,
 };
 pub use rhythm::{
     EventRecord, EventType, Rhythm, RhythmDefinition, RhythmID, RhythmManager, Slider,
 };
-pub use store::{CadenceDocument, StoredEventRecord, StoredRhythm};
+pub use store::{CadenceDocument, StoredEventRecord, StoredProactiveCheckIn, StoredRhythm};
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 

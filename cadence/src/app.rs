@@ -1,12 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 
 use crate::api_types::{ConvergenceResponse, DelinquentItem, ScheduleItem};
-use crate::{CadenceDocument, Error, Rhythm, RhythmID, Slider, StoredRhythm};
+use crate::{
+    CadenceDocument, Error, Rhythm, RhythmID, Slider, StoredProactiveCheckIn, StoredRhythm,
+};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -79,6 +81,21 @@ pub struct RhythmUpdate {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TodayRenderOptions {
     pub include_regular_heading: bool,
+}
+
+pub const PROACTIVE_CHECK_IN_HISTORY_LIMIT: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProactiveDueGroup {
+    pub due_at_utc: DateTime<Utc>,
+    pub rhythm_ids: Vec<RhythmID>,
+    pub items: Vec<ScheduleItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProactiveCheckInPlan {
+    pub due_now: ProactiveDueGroup,
+    pub backlog: Vec<ProactiveDueGroup>,
 }
 
 pub fn default_file_path() -> PathBuf {
@@ -394,6 +411,171 @@ pub fn schedule_items(
         .collect())
 }
 
+fn sorted_rhythm_ids_for_items(items: &[ScheduleItem]) -> Result<Vec<RhythmID>> {
+    let mut ids = items
+        .iter()
+        .map(|item| parse_rhythm_id(&item.rhythm_id))
+        .collect::<Result<Vec<_>>>()?;
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn proactive_check_in_matches(
+    check_in: &StoredProactiveCheckIn,
+    due_at_utc: DateTime<Utc>,
+    rhythm_ids: &[RhythmID],
+) -> bool {
+    if check_in.due_at_utc != due_at_utc {
+        return false;
+    }
+    let mut checked_ids = check_in.rhythm_ids.clone();
+    checked_ids.sort();
+    checked_ids.dedup();
+    checked_ids == rhythm_ids
+}
+
+fn proactive_group_already_checked_in(
+    document: &CadenceDocument,
+    due_at_utc: DateTime<Utc>,
+    rhythm_ids: &[RhythmID],
+) -> bool {
+    document
+        .proactive_check_ins
+        .iter()
+        .any(|check_in| proactive_check_in_matches(check_in, due_at_utc, rhythm_ids))
+}
+
+pub fn proactive_due_groups(
+    document: &CadenceDocument,
+    now: DateTime<Utc>,
+    horizon_days: u32,
+) -> Result<Vec<ProactiveDueGroup>> {
+    let user_tz = document_timezone(document)?;
+    let start_date = now.with_timezone(&user_tz).date_naive();
+    let mut grouped = BTreeMap::<DateTime<Utc>, Vec<ScheduleItem>>::new();
+
+    for item in schedule_items(document, start_date, horizon_days)? {
+        grouped.entry(item.datetime).or_default().push(item);
+    }
+
+    let mut groups = Vec::new();
+    for (due_at_utc, mut items) in grouped {
+        items.sort_by(|left, right| {
+            left.datetime
+                .cmp(&right.datetime)
+                .then(left.rhythm_id.cmp(&right.rhythm_id))
+        });
+        let rhythm_ids = sorted_rhythm_ids_for_items(&items)?;
+        if !proactive_group_already_checked_in(document, due_at_utc, &rhythm_ids) {
+            groups.push(ProactiveDueGroup {
+                due_at_utc,
+                rhythm_ids,
+                items,
+            });
+        }
+    }
+    Ok(groups)
+}
+
+fn proactive_rate_limit_allows(
+    document: &CadenceDocument,
+    now: DateTime<Utc>,
+    min_interval: Duration,
+) -> bool {
+    document
+        .last_proactive_check_in_utc
+        .map(|last| now.signed_duration_since(last) >= min_interval)
+        .unwrap_or(true)
+}
+
+pub fn plan_startup_proactive_check_in(
+    document: &CadenceDocument,
+    now: DateTime<Utc>,
+    min_interval: Duration,
+    horizon_days: u32,
+) -> Result<Option<ProactiveCheckInPlan>> {
+    if !proactive_rate_limit_allows(document, now, min_interval) {
+        return Ok(None);
+    }
+    let due_now = proactive_due_groups(document, now, horizon_days)?
+        .into_iter()
+        .find(|group| group.due_at_utc <= now);
+    Ok(due_now.map(|due_now| ProactiveCheckInPlan {
+        due_now,
+        backlog: Vec::new(),
+    }))
+}
+
+pub fn plan_scheduled_proactive_check_in(
+    document: &CadenceDocument,
+    scheduled_due_at_utc: DateTime<Utc>,
+    now: DateTime<Utc>,
+    min_interval: Duration,
+    horizon_days: u32,
+) -> Result<Option<ProactiveCheckInPlan>> {
+    if scheduled_due_at_utc > now || !proactive_rate_limit_allows(document, now, min_interval) {
+        return Ok(None);
+    }
+    let groups = proactive_due_groups(document, now, horizon_days)?;
+    let due_now = groups
+        .iter()
+        .find(|group| group.due_at_utc == scheduled_due_at_utc)
+        .cloned();
+    let Some(due_now) = due_now else {
+        return Ok(None);
+    };
+    let backlog = groups
+        .into_iter()
+        .filter(|group| group.due_at_utc < scheduled_due_at_utc)
+        .collect();
+    Ok(Some(ProactiveCheckInPlan { due_now, backlog }))
+}
+
+pub fn next_proactive_due_at_after(
+    document: &CadenceDocument,
+    after: DateTime<Utc>,
+    horizon_days: u32,
+) -> Result<Option<DateTime<Utc>>> {
+    Ok(proactive_due_groups(document, after, horizon_days)?
+        .into_iter()
+        .find(|group| group.due_at_utc > after)
+        .map(|group| group.due_at_utc))
+}
+
+pub fn record_proactive_check_in_plan(
+    document: &mut CadenceDocument,
+    plan: &ProactiveCheckInPlan,
+    checked_in_at_utc: DateTime<Utc>,
+) {
+    document.last_proactive_check_in_utc = Some(checked_in_at_utc);
+
+    let mut checked_groups = plan.backlog.clone();
+    checked_groups.push(plan.due_now.clone());
+
+    for group in checked_groups {
+        document.proactive_check_ins.retain(|check_in| {
+            !proactive_check_in_matches(check_in, group.due_at_utc, &group.rhythm_ids)
+        });
+        document.proactive_check_ins.push(StoredProactiveCheckIn {
+            due_at_utc: group.due_at_utc,
+            rhythm_ids: group.rhythm_ids,
+            checked_in_at_utc,
+        });
+    }
+
+    document
+        .proactive_check_ins
+        .sort_by_key(|check_in| check_in.checked_in_at_utc);
+    let excess = document
+        .proactive_check_ins
+        .len()
+        .saturating_sub(PROACTIVE_CHECK_IN_HISTORY_LIMIT);
+    if excess > 0 {
+        document.proactive_check_ins.drain(0..excess);
+    }
+}
+
 pub fn render_schedule_items(items: &[ScheduleItem], user_tz: &Tz, empty_message: &str) -> String {
     if items.is_empty() {
         return empty_message.to_string();
@@ -521,6 +703,8 @@ mod tests {
         CadenceDocument {
             version: crate::store::CURRENT_DOCUMENT_VERSION,
             timezone: "UTC".to_string(),
+            last_proactive_check_in_utc: None,
+            proactive_check_ins: Vec::new(),
             spoons: Default::default(),
             rhythms: vec![StoredRhythm {
                 id: rhythm_id,
@@ -714,5 +898,89 @@ mod tests {
         .unwrap_err();
 
         assert_eq!("Spoons value must be in range 0-10", err.to_string());
+    }
+
+    fn daily_stored_rhythm(description: &str, at: NaiveTime) -> StoredRhythm {
+        StoredRhythm {
+            id: RhythmID::generate().unwrap(),
+            rhythm: Rhythm::Daily { at },
+            description: description.to_string(),
+            created_at: timestamp(1, 9, 0),
+            created_at_tz: "UTC".to_string(),
+            modified_at: timestamp(1, 9, 0),
+            modified_at_tz: "UTC".to_string(),
+            last_done: None,
+            last_defer: None,
+        }
+    }
+
+    fn proactive_test_document() -> CadenceDocument {
+        let mut document = CadenceDocument::new("UTC");
+        document.rhythms = vec![
+            daily_stored_rhythm("Morning meds", time(9, 0, 0)),
+            daily_stored_rhythm("Water plants", time(10, 0, 0)),
+        ];
+        document
+    }
+
+    #[test]
+    fn startup_proactive_plan_uses_earliest_due_group_only() {
+        let document = proactive_test_document();
+        let now = Utc.with_ymd_and_hms(2026, 4, 5, 10, 30, 0).unwrap();
+        let plan = plan_startup_proactive_check_in(&document, now, Duration::hours(1), 90).unwrap();
+        let plan = plan.expect("startup should catch up one due group");
+
+        assert_eq!(timestamp(5, 9, 0), plan.due_now.due_at_utc);
+        assert_eq!(vec!["Morning meds"], descriptions(&plan.due_now.items));
+        assert!(plan.backlog.is_empty());
+    }
+
+    #[test]
+    fn scheduled_proactive_plan_includes_earlier_unchecked_backlog() {
+        let document = proactive_test_document();
+        let now = Utc.with_ymd_and_hms(2026, 4, 5, 10, 0, 0).unwrap();
+        let plan =
+            plan_scheduled_proactive_check_in(&document, now, now, Duration::hours(1), 90).unwrap();
+        let plan = plan.expect("scheduled due time should produce a check-in");
+
+        assert_eq!(timestamp(5, 10, 0), plan.due_now.due_at_utc);
+        assert_eq!(vec!["Water plants"], descriptions(&plan.due_now.items));
+        assert_eq!(1, plan.backlog.len());
+        assert_eq!(timestamp(5, 9, 0), plan.backlog[0].due_at_utc);
+        assert_eq!(vec!["Morning meds"], descriptions(&plan.backlog[0].items));
+    }
+
+    #[test]
+    fn record_proactive_check_in_plan_suppresses_included_groups() {
+        let mut document = proactive_test_document();
+        let now = Utc.with_ymd_and_hms(2026, 4, 5, 10, 0, 0).unwrap();
+        let plan = plan_scheduled_proactive_check_in(&document, now, now, Duration::hours(1), 90)
+            .unwrap()
+            .unwrap();
+
+        record_proactive_check_in_plan(&mut document, &plan, now);
+
+        assert_eq!(Some(now), document.last_proactive_check_in_utc);
+        assert_eq!(2, document.proactive_check_ins.len());
+        let repeated =
+            plan_scheduled_proactive_check_in(&document, now, now, Duration::hours(1), 90).unwrap();
+        assert!(repeated.is_none());
+    }
+
+    #[test]
+    fn proactive_rate_limit_suppresses_due_group() {
+        let mut document = proactive_test_document();
+        document.last_proactive_check_in_utc =
+            Some(Utc.with_ymd_and_hms(2026, 4, 5, 9, 30, 0).unwrap());
+        let now = Utc.with_ymd_and_hms(2026, 4, 5, 10, 0, 0).unwrap();
+
+        let plan =
+            plan_scheduled_proactive_check_in(&document, now, now, Duration::hours(1), 90).unwrap();
+
+        assert!(plan.is_none());
+    }
+
+    fn descriptions(items: &[ScheduleItem]) -> Vec<&str> {
+        items.iter().map(|item| item.description.as_str()).collect()
     }
 }

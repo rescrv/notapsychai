@@ -103,9 +103,20 @@ impl StoredRhythm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct StoredProactiveCheckIn {
+    pub due_at_utc: DateTime<Utc>,
+    pub rhythm_ids: Vec<RhythmID>,
+    pub checked_in_at_utc: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CadenceDocument {
     pub version: u32,
     pub timezone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_proactive_check_in_utc: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proactive_check_ins: Vec<StoredProactiveCheckIn>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub spoons: BTreeMap<NaiveDate, u8>,
     #[serde(default)]
@@ -117,6 +128,8 @@ impl CadenceDocument {
         Self {
             version: CURRENT_DOCUMENT_VERSION,
             timezone: timezone.into(),
+            last_proactive_check_in_utc: None,
+            proactive_check_ins: Vec::new(),
             spoons: BTreeMap::new(),
             rhythms: Vec::new(),
         }
@@ -307,6 +320,8 @@ mod tests {
         let document = CadenceDocument {
             version: CURRENT_DOCUMENT_VERSION,
             timezone: "UTC".to_string(),
+            last_proactive_check_in_utc: None,
+            proactive_check_ins: Vec::new(),
             spoons: BTreeMap::from([(NaiveDate::from_ymd_opt(2026, 4, 11).unwrap(), 4)]),
             rhythms: vec![StoredRhythm {
                 id: rhythm_id,
@@ -332,6 +347,44 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&document).unwrap();
+        let decoded: CadenceDocument = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(decoded, document);
+    }
+
+    #[test]
+    fn yaml_round_trip_preserves_proactive_state() {
+        let rhythm_id = RhythmID::generate().unwrap();
+        let checked_in_at = Utc.with_ymd_and_hms(2026, 4, 11, 9, 0, 5).unwrap();
+        let due_at = Utc.with_ymd_and_hms(2026, 4, 11, 9, 0, 0).unwrap();
+        let document = CadenceDocument {
+            version: CURRENT_DOCUMENT_VERSION,
+            timezone: "UTC".to_string(),
+            last_proactive_check_in_utc: Some(checked_in_at),
+            proactive_check_ins: vec![StoredProactiveCheckIn {
+                due_at_utc: due_at,
+                rhythm_ids: vec![rhythm_id],
+                checked_in_at_utc: checked_in_at,
+            }],
+            spoons: BTreeMap::new(),
+            rhythms: vec![StoredRhythm {
+                id: rhythm_id,
+                rhythm: Rhythm::Daily {
+                    at: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                },
+                description: "Review backlog".to_string(),
+                created_at: Utc.with_ymd_and_hms(2026, 4, 1, 12, 0, 0).unwrap(),
+                created_at_tz: "UTC".to_string(),
+                modified_at: Utc.with_ymd_and_hms(2026, 4, 1, 12, 0, 0).unwrap(),
+                modified_at_tz: "UTC".to_string(),
+                last_done: None,
+                last_defer: None,
+            }],
+        };
+
+        let yaml = serde_yaml::to_string(&document).unwrap();
+        assert!(yaml.contains("last_proactive_check_in_utc:"));
+        assert!(yaml.contains("proactive_check_ins:"));
+
         let decoded: CadenceDocument = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(decoded, document);
     }

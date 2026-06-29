@@ -33,7 +33,7 @@ pub struct CreateRhythmRequest {
     pub description: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleItem {
     pub rhythm_id: String,
     pub description: String,

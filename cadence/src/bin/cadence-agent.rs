@@ -21,16 +21,20 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration as StdDuration;
 
 use arrrg::CommandLine;
 use cadence_agent::{
-    CadenceDocument, RhythmID, RhythmInput, RhythmUpdate, TodayRenderOptions, add_rhythm,
-    build_rhythm, convergence_response, default_file_path, defer_rhythm, delete_rhythm,
+    CadenceDocument, ProactiveCheckInPlan, RhythmID, RhythmInput, RhythmUpdate, TodayRenderOptions,
+    add_rhythm, build_rhythm, convergence_response, default_file_path, defer_rhythm, delete_rhythm,
     delinquent_items, document_timezone, format_rhythm, list_rhythms, load_document,
-    mark_rhythm_done, parse_date, parse_rhythm_id, parse_time, render_delinquent_items,
-    render_schedule_items, render_today_items, rhythm_kind_name, save_document, schedule_items,
-    set_spoons, today_items, update_rhythm,
+    mark_rhythm_done, next_proactive_due_at_after, parse_date, parse_rhythm_id, parse_time,
+    plan_scheduled_proactive_check_in, plan_startup_proactive_check_in, proactive_due_groups,
+    record_proactive_check_in_plan, render_delinquent_items, render_schedule_items,
+    render_today_items, rhythm_kind_name, save_document, schedule_items, set_spoons, today_items,
+    update_rhythm,
 };
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use chrono_tz::Tz;
 use claudius::Agent;
 use claudius::AgentStreamContext;
@@ -58,11 +62,13 @@ use claudius::ToolUseBlock;
 use claudius::TurnOutcome;
 use claudius::chat::ChatConfig;
 use claudius_telegram::{
-    Error as TelegramError, FileStateStore, Inbound, LoopConfig, PreFilter, StateStore,
-    StdinTransport, TelegramTransport, TransportState, run_agent_loop,
+    ChatId, ChatTransport, Error as TelegramError, FileStateStore, Inbound, LoopConfig,
+    OutboxStatus, PreFilter, StateStore, StdinTransport, SyntheticTurnConfig, TelegramTransport,
+    TransportState, known_chats, run_agent_loop, run_synthetic_user_turn,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../prompts/default-system.md");
 
@@ -106,6 +112,14 @@ struct CliOptions {
         "N"
     )]
     history_message_threshold: Option<usize>,
+    #[arrrg(flag, "Disable proactive Telegram check-ins at scheduled due times")]
+    disable_proactive_checkins: bool,
+    #[arrrg(
+        optional,
+        "Minimum time between proactive check-ins per chat [default: 1h]",
+        "DURATION"
+    )]
+    proactive_min_interval: Option<String>,
 }
 
 //////////////////////////////////////////// Shared State //////////////////////////////////////////
@@ -125,6 +139,15 @@ const REQUEST_LOG_SCHEMA: &str = "cadence.request_log.v1";
 
 /// Maximum persisted chat messages to send back to the model before resetting history.
 const DEFAULT_HISTORY_MESSAGE_THRESHOLD: usize = 40;
+
+/// Default minimum time between proactive check-ins for one chat.
+const DEFAULT_PROACTIVE_MIN_INTERVAL_SECS: i64 = 60 * 60;
+
+/// Number of days to scan for future proactive alarms.
+const PROACTIVE_SCAN_HORIZON_DAYS: u32 = 90;
+
+/// How often to rescan when no scheduled items exist in the scan horizon.
+const PROACTIVE_IDLE_RESCAN_SECS: u64 = 60 * 60;
 
 /// Tool names that do not count toward the mutation cap.
 const READ_ONLY_TOOLS: &[&str] = &[
@@ -183,6 +206,8 @@ struct CadenceAgent {
     mutation_counter: Arc<MutationCounter>,
     file_path: SharedFilePath,
     config: ChatConfig,
+    schedule_changed: Option<Arc<Notify>>,
+    turn_source: String,
 }
 
 impl CadenceAgent {
@@ -191,14 +216,42 @@ impl CadenceAgent {
         mutation_counter: Arc<MutationCounter>,
         file_path: SharedFilePath,
         config: ChatConfig,
+        schedule_changed: Option<Arc<Notify>>,
     ) -> Self {
         Self {
             document,
             mutation_counter,
             file_path,
             config,
+            schedule_changed,
+            turn_source: "live".to_string(),
         }
     }
+}
+
+fn personality_path_for_yaml_path(yaml_path: &Path) -> PathBuf {
+    yaml_path.with_extension("md")
+}
+
+fn build_system_prompt_for_yaml_path(yaml_path: &Path) -> String {
+    let mut prompt = DEFAULT_SYSTEM_PROMPT.to_string();
+    let personality_path = personality_path_for_yaml_path(yaml_path);
+    match fs::read_to_string(&personality_path) {
+        Ok(personality) if !personality.trim().is_empty() => {
+            prompt.push_str("\n\n<personality>\n");
+            prompt.push_str(personality.trim());
+            prompt.push_str("\n</personality>");
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "[cadence-agent] failed to read personality file {}: {err}",
+                personality_path.display()
+            );
+        }
+    }
+    prompt
 }
 
 #[async_trait::async_trait]
@@ -212,7 +265,10 @@ impl Agent for CadenceAgent {
     }
 
     async fn system(&self) -> Option<SystemPrompt> {
-        Some(SystemPrompt::String(DEFAULT_SYSTEM_PROMPT.to_string()))
+        let yaml_path = self.file_path.lock().unwrap().clone();
+        Some(SystemPrompt::String(build_system_prompt_for_yaml_path(
+            &yaml_path,
+        )))
     }
 
     fn stream_label(&self) -> String {
@@ -243,7 +299,7 @@ impl Agent for CadenceAgent {
         {
             let yaml_path = self.file_path.lock().unwrap().clone();
             if let Some(entry) = build_request_log_entry(
-                "live",
+                &self.turn_source,
                 chat_id_from_yaml_path(&yaml_path),
                 &yaml_path,
                 None,
@@ -274,26 +330,32 @@ impl Agent for CadenceAgent {
             Arc::new(AddRhythmTool::new(
                 Arc::clone(&self.document),
                 Arc::clone(&self.file_path),
+                self.schedule_changed.clone(),
             )),
             Arc::new(UpdateRhythmTool::new(
                 Arc::clone(&self.document),
                 Arc::clone(&self.file_path),
+                self.schedule_changed.clone(),
             )),
             Arc::new(DeleteRhythmTool::new(
                 Arc::clone(&self.document),
                 Arc::clone(&self.file_path),
+                self.schedule_changed.clone(),
             )),
             Arc::new(MarkDoneTool::new(
                 Arc::clone(&self.document),
                 Arc::clone(&self.file_path),
+                self.schedule_changed.clone(),
             )),
             Arc::new(DeferRhythmTool::new(
                 Arc::clone(&self.document),
                 Arc::clone(&self.file_path),
+                self.schedule_changed.clone(),
             )),
             Arc::new(SetSpoonsTool::new(
                 Arc::clone(&self.document),
                 Arc::clone(&self.file_path),
+                self.schedule_changed.clone(),
             )),
         ]
     }
@@ -342,6 +404,94 @@ impl Agent for CadenceAgent {
             }
         }
         ControlFlow::Continue(tool_results)
+    }
+}
+
+#[derive(Clone)]
+struct SharedCadenceAgent {
+    inner: Arc<AsyncMutex<CadenceAgent>>,
+    turn_source: String,
+    document_context: Option<(SharedDocument, SharedFilePath)>,
+}
+
+impl SharedCadenceAgent {
+    fn new(agent: CadenceAgent) -> Self {
+        Self {
+            inner: Arc::new(AsyncMutex::new(agent)),
+            turn_source: "live".to_string(),
+            document_context: None,
+        }
+    }
+
+    fn with_turn_source(&self, turn_source: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            turn_source: turn_source.into(),
+            document_context: self.document_context.clone(),
+        }
+    }
+
+    fn with_document_context(&self, document: SharedDocument, file_path: SharedFilePath) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            turn_source: self.turn_source.clone(),
+            document_context: Some((document, file_path)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for SharedCadenceAgent {
+    async fn max_tokens(&self) -> u32 {
+        self.inner.lock().await.max_tokens().await
+    }
+
+    async fn model(&self) -> Model {
+        self.inner.lock().await.model().await
+    }
+
+    async fn system(&self) -> Option<SystemPrompt> {
+        self.inner.lock().await.system().await
+    }
+
+    fn stream_label(&self) -> String {
+        "CadenceAgent".to_string()
+    }
+
+    fn caching_enabled(&self) -> bool {
+        true
+    }
+
+    async fn take_turn_streaming(
+        &mut self,
+        client: &Anthropic,
+        messages: &mut Vec<MessageParam>,
+        budget: &Arc<Budget>,
+        renderer: &mut dyn Renderer,
+        context: AgentStreamContext,
+    ) -> Result<TurnOutcome, claudius::Error> {
+        let mut inner = self.inner.lock().await;
+        let previous_source = std::mem::replace(&mut inner.turn_source, self.turn_source.clone());
+        let previous_context = if let Some((document, file_path)) = self.document_context.as_ref() {
+            Some((
+                std::mem::replace(&mut inner.document, Arc::clone(document)),
+                std::mem::replace(&mut inner.file_path, Arc::clone(file_path)),
+            ))
+        } else {
+            None
+        };
+
+        let result = inner
+            .take_turn_streaming(client, messages, budget, renderer, context)
+            .await;
+
+        inner.turn_source = previous_source;
+        if let Some((document, file_path)) = previous_context {
+            inner.document = document;
+            inner.file_path = file_path;
+        }
+
+        result
     }
 }
 
@@ -470,6 +620,12 @@ fn save_current_document_or_tool_err(
 ) -> Result<(), Box<dyn IntermediateToolResult>> {
     let file_path = file_path.lock().unwrap().clone();
     save_document_or_tool_err(tool_use_id, &file_path, document, action)
+}
+
+fn notify_schedule_changed(schedule_changed: &Option<Arc<Notify>>) {
+    if let Some(schedule_changed) = schedule_changed {
+        schedule_changed.notify_waiters();
+    }
 }
 
 fn parse_rhythm_input(tool_use: &ToolUseBlock) -> Result<RhythmInput, String> {
@@ -1037,13 +1193,19 @@ impl<A: Agent> CadenceToolLogic<A> for ShowSpoonsCallback {
 struct AddRhythmTool {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 impl AddRhythmTool {
-    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
+    fn new(
+        document: SharedDocument,
+        file_path: SharedFilePath,
+        schedule_changed: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             document,
             file_path,
+            schedule_changed,
         }
     }
 }
@@ -1057,6 +1219,7 @@ impl<A: Agent> Tool<A> for AddRhythmTool {
         cadence_tool_callback(AddRhythmCallback {
             document: Arc::clone(&self.document),
             file_path: self.file_path.clone(),
+            schedule_changed: self.schedule_changed.clone(),
         })
     }
 
@@ -1111,6 +1274,7 @@ impl<A: Agent> Tool<A> for AddRhythmTool {
 struct AddRhythmCallback {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -1144,6 +1308,7 @@ impl<A: Agent> CadenceToolLogic<A> for AddRhythmCallback {
         {
             return err;
         }
+        notify_schedule_changed(&self.schedule_changed);
 
         tool_ok(
             &tool_use.id,
@@ -1157,13 +1322,19 @@ impl<A: Agent> CadenceToolLogic<A> for AddRhythmCallback {
 struct UpdateRhythmTool {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 impl UpdateRhythmTool {
-    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
+    fn new(
+        document: SharedDocument,
+        file_path: SharedFilePath,
+        schedule_changed: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             document,
             file_path,
+            schedule_changed,
         }
     }
 }
@@ -1177,6 +1348,7 @@ impl<A: Agent> Tool<A> for UpdateRhythmTool {
         cadence_tool_callback(UpdateRhythmCallback {
             document: Arc::clone(&self.document),
             file_path: self.file_path.clone(),
+            schedule_changed: self.schedule_changed.clone(),
         })
     }
 
@@ -1236,6 +1408,7 @@ impl<A: Agent> Tool<A> for UpdateRhythmTool {
 struct UpdateRhythmCallback {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -1283,6 +1456,7 @@ impl<A: Agent> CadenceToolLogic<A> for UpdateRhythmCallback {
         {
             return err;
         }
+        notify_schedule_changed(&self.schedule_changed);
 
         tool_ok(&tool_use.id, format!("Rhythm {id_str} updated"))
     }
@@ -1293,13 +1467,19 @@ impl<A: Agent> CadenceToolLogic<A> for UpdateRhythmCallback {
 struct DeleteRhythmTool {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 impl DeleteRhythmTool {
-    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
+    fn new(
+        document: SharedDocument,
+        file_path: SharedFilePath,
+        schedule_changed: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             document,
             file_path,
+            schedule_changed,
         }
     }
 }
@@ -1313,6 +1493,7 @@ impl<A: Agent> Tool<A> for DeleteRhythmTool {
         cadence_tool_callback(DeleteRhythmCallback {
             document: Arc::clone(&self.document),
             file_path: self.file_path.clone(),
+            schedule_changed: self.schedule_changed.clone(),
         })
     }
 
@@ -1335,6 +1516,7 @@ impl<A: Agent> Tool<A> for DeleteRhythmTool {
 struct DeleteRhythmCallback {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -1360,6 +1542,7 @@ impl<A: Agent> CadenceToolLogic<A> for DeleteRhythmCallback {
         {
             return err;
         }
+        notify_schedule_changed(&self.schedule_changed);
 
         tool_ok(&tool_use.id, format!("Rhythm {id_str} deleted"))
     }
@@ -1370,13 +1553,19 @@ impl<A: Agent> CadenceToolLogic<A> for DeleteRhythmCallback {
 struct MarkDoneTool {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 impl MarkDoneTool {
-    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
+    fn new(
+        document: SharedDocument,
+        file_path: SharedFilePath,
+        schedule_changed: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             document,
             file_path,
+            schedule_changed,
         }
     }
 }
@@ -1390,6 +1579,7 @@ impl<A: Agent> Tool<A> for MarkDoneTool {
         cadence_tool_callback(MarkDoneCallback {
             document: Arc::clone(&self.document),
             file_path: self.file_path.clone(),
+            schedule_changed: self.schedule_changed.clone(),
         })
     }
 
@@ -1412,6 +1602,7 @@ impl<A: Agent> Tool<A> for MarkDoneTool {
 struct MarkDoneCallback {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -1460,6 +1651,7 @@ impl<A: Agent> CadenceToolLogic<A> for MarkDoneCallback {
         {
             return err;
         }
+        notify_schedule_changed(&self.schedule_changed);
 
         tool_ok(&tool_use.id, results.join("\n"))
     }
@@ -1470,13 +1662,19 @@ impl<A: Agent> CadenceToolLogic<A> for MarkDoneCallback {
 struct DeferRhythmTool {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 impl DeferRhythmTool {
-    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
+    fn new(
+        document: SharedDocument,
+        file_path: SharedFilePath,
+        schedule_changed: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             document,
             file_path,
+            schedule_changed,
         }
     }
 }
@@ -1490,6 +1688,7 @@ impl<A: Agent> Tool<A> for DeferRhythmTool {
         cadence_tool_callback(DeferRhythmCallback {
             document: Arc::clone(&self.document),
             file_path: self.file_path.clone(),
+            schedule_changed: self.schedule_changed.clone(),
         })
     }
 
@@ -1512,6 +1711,7 @@ impl<A: Agent> Tool<A> for DeferRhythmTool {
 struct DeferRhythmCallback {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -1539,6 +1739,7 @@ impl<A: Agent> CadenceToolLogic<A> for DeferRhythmCallback {
         ) {
             return err;
         }
+        notify_schedule_changed(&self.schedule_changed);
 
         tool_ok(&tool_use.id, format!("Rhythm {id_str} deferred"))
     }
@@ -1549,13 +1750,19 @@ impl<A: Agent> CadenceToolLogic<A> for DeferRhythmCallback {
 struct SetSpoonsTool {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 impl SetSpoonsTool {
-    fn new(document: SharedDocument, file_path: SharedFilePath) -> Self {
+    fn new(
+        document: SharedDocument,
+        file_path: SharedFilePath,
+        schedule_changed: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             document,
             file_path,
+            schedule_changed,
         }
     }
 }
@@ -1569,6 +1776,7 @@ impl<A: Agent> Tool<A> for SetSpoonsTool {
         cadence_tool_callback(SetSpoonsCallback {
             document: Arc::clone(&self.document),
             file_path: self.file_path.clone(),
+            schedule_changed: self.schedule_changed.clone(),
         })
     }
 
@@ -1598,6 +1806,7 @@ impl<A: Agent> Tool<A> for SetSpoonsTool {
 struct SetSpoonsCallback {
     document: SharedDocument,
     file_path: SharedFilePath,
+    schedule_changed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -1637,6 +1846,7 @@ impl<A: Agent> CadenceToolLogic<A> for SetSpoonsCallback {
         {
             return err;
         }
+        notify_schedule_changed(&self.schedule_changed);
 
         tool_ok(&tool_use.id, format!("Spoons set to {value} for {date}"))
     }
@@ -1696,6 +1906,390 @@ fn stamp_latest_user_message(messages: &mut [MessageParam], document: &SharedDoc
     }
     let raw = std::mem::take(text);
     *text = timestamped_user_message_content(&raw, document);
+}
+
+fn parse_duration_seconds(raw: &str) -> Result<i64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+
+    let split_at = raw
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(raw.len());
+    let (number, unit) = raw.split_at(split_at);
+    if number.is_empty() {
+        return Err(format!("invalid duration: {raw}"));
+    }
+    let value = number
+        .parse::<i64>()
+        .map_err(|_| format!("invalid duration value: {raw}"))?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        "d" | "day" | "days" => 24 * 60 * 60,
+        other => return Err(format!("unsupported duration unit: {other}")),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration is too large: {raw}"))
+}
+
+fn proactive_min_interval(raw: Option<&str>) -> Result<ChronoDuration, TelegramError> {
+    let seconds = match raw {
+        Some(raw) => parse_duration_seconds(raw).map_err(|err| {
+            TelegramError::Internal(format!("invalid --proactive-min-interval: {err}"))
+        })?,
+        None => DEFAULT_PROACTIVE_MIN_INTERVAL_SECS,
+    };
+    Ok(ChronoDuration::seconds(seconds))
+}
+
+fn render_proactive_group(group: &cadence_agent::ProactiveDueGroup, user_tz: &Tz) -> Vec<String> {
+    group
+        .items
+        .iter()
+        .map(|item| {
+            let local_time = item.datetime.with_timezone(user_tz);
+            format!(
+                "- {} - {} [{}]",
+                local_time.format("%Y-%m-%d %H:%M:%S"),
+                item.description,
+                item.rhythm_id
+            )
+        })
+        .collect()
+}
+
+fn build_proactive_check_in_prompt(
+    document: &CadenceDocument,
+    plan: &ProactiveCheckInPlan,
+    now_utc: DateTime<Utc>,
+) -> String {
+    let user_tz = document_timezone(document).unwrap_or(Tz::UTC);
+    let now = now_utc.with_timezone(&user_tz);
+    let mut lines = vec![
+        format!(
+            "Current timestamp: {} ({})",
+            now.to_rfc3339(),
+            now.timezone()
+        ),
+        String::new(),
+        "Proactive wakeup: the following scheduled items are due now:".to_string(),
+    ];
+    lines.extend(render_proactive_group(&plan.due_now, &user_tz));
+
+    if !plan.backlog.is_empty() {
+        lines.push(String::new());
+        lines.push("Earlier unchecked scheduled groups:".to_string());
+        for group in &plan.backlog {
+            let due_at = group.due_at_utc.with_timezone(&user_tz);
+            lines.push(format!("Due at {}:", due_at.format("%Y-%m-%d %H:%M:%S")));
+            lines.extend(render_proactive_group(group, &user_tz));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Send the user a concise, natural check-in about these due items. \
+         Do not mark anything done, defer rhythms, add rhythms, update rhythms, \
+         delete rhythms, or set spoons in this proactive turn. Ask the user what \
+         they want to do instead of assuming completion."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn chat_has_pending_outbox(state: &TransportState, chat: ChatId) -> bool {
+    state
+        .outbox
+        .iter()
+        .any(|record| record.chat == chat && record.status == OutboxStatus::Pending)
+}
+
+fn proactive_rate_limit_retry_at(
+    document: &CadenceDocument,
+    now: DateTime<Utc>,
+    min_interval: ChronoDuration,
+) -> Option<DateTime<Utc>> {
+    let retry_at = document.last_proactive_check_in_utc? + min_interval;
+    if retry_at <= now {
+        return None;
+    }
+    let has_due_backlog = proactive_due_groups(document, now, PROACTIVE_SCAN_HORIZON_DAYS)
+        .ok()?
+        .iter()
+        .any(|group| group.due_at_utc <= now);
+    has_due_backlog.then_some(retry_at)
+}
+
+fn save_proactive_check_in_record(
+    path: &Path,
+    plan: &ProactiveCheckInPlan,
+    checked_in_at_utc: DateTime<Utc>,
+) -> Result<(), cadence_agent::Error> {
+    let mut document = load_document(path)?;
+    record_proactive_check_in_plan(&mut document, plan, checked_in_at_utc);
+    save_document(path, &document)
+}
+
+#[derive(Clone, Copy)]
+enum ProactivePass {
+    Startup,
+    Scheduled(DateTime<Utc>),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_model_proactive_check_in<T>(
+    agent_template: &SharedCadenceAgent,
+    transport: &T,
+    client: &Anthropic,
+    store: &dyn StateStore,
+    state: &Arc<AsyncMutex<TransportState>>,
+    budget: &Arc<Budget>,
+    chat: ChatId,
+    path: &Path,
+    document: &CadenceDocument,
+    plan: &ProactiveCheckInPlan,
+    history_message_threshold: usize,
+) -> Result<(), TelegramError>
+where
+    T: ChatTransport + Sync + ?Sized,
+{
+    let checked_in_at_utc = Utc::now();
+    let prompt = build_proactive_check_in_prompt(document, plan, checked_in_at_utc);
+    let document_context: SharedDocument = Arc::new(Mutex::new(document.clone()));
+    let file_path_context: SharedFilePath = Arc::new(Mutex::new(path.to_path_buf()));
+    let mut agent = agent_template
+        .with_turn_source("proactive")
+        .with_document_context(document_context, file_path_context);
+
+    run_synthetic_user_turn(
+        &mut agent,
+        transport,
+        client,
+        store,
+        state,
+        budget,
+        chat,
+        prompt,
+        SyntheticTurnConfig {
+            max_history_messages: Some(history_message_threshold),
+            reset_on_context_limit: true,
+            use_outbox: true,
+            source_label: Some("cadence-proactive".to_string()),
+        },
+    )
+    .await?;
+
+    save_proactive_check_in_record(path, plan, checked_in_at_utc).map_err(|err| {
+        TelegramError::Internal(format!(
+            "sent proactive check-in for chat {chat} but failed to record it in {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_proactive_pass<T>(
+    pass: ProactivePass,
+    agent: &SharedCadenceAgent,
+    transport: &T,
+    client: &Anthropic,
+    store: &Arc<dyn StateStore>,
+    state: &Arc<AsyncMutex<TransportState>>,
+    budget: &Arc<Budget>,
+    yaml_dir: &Path,
+    min_interval: ChronoDuration,
+    history_message_threshold: usize,
+    interrupted: &Arc<AtomicBool>,
+) -> Option<DateTime<Utc>>
+where
+    T: ChatTransport + Sync + ?Sized,
+{
+    let chats = {
+        let state = state.lock().await;
+        known_chats(&state)
+    };
+    let mut next_due_at = None;
+
+    for chat in chats {
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let has_pending = {
+            let state = state.lock().await;
+            chat_has_pending_outbox(&state, chat)
+        };
+        if has_pending {
+            eprintln!(
+                "[cadence-agent] skipping proactive check-in for chat {chat}; pending outbox exists"
+            );
+            continue;
+        }
+
+        let path = user_yaml_path(yaml_dir, chat.0);
+        if !path.is_file() {
+            continue;
+        }
+
+        let document = match load_document(&path) {
+            Ok(document) => document,
+            Err(err) => {
+                eprintln!(
+                    "[cadence-agent] failed to load proactive document {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let now = Utc::now();
+        let plan = match pass {
+            ProactivePass::Startup => plan_startup_proactive_check_in(
+                &document,
+                now,
+                min_interval,
+                PROACTIVE_SCAN_HORIZON_DAYS,
+            ),
+            ProactivePass::Scheduled(scheduled_due_at_utc) => plan_scheduled_proactive_check_in(
+                &document,
+                scheduled_due_at_utc,
+                now,
+                min_interval,
+                PROACTIVE_SCAN_HORIZON_DAYS,
+            ),
+        };
+
+        match plan {
+            Ok(Some(plan)) => {
+                eprintln!(
+                    "[cadence-agent] proactive check-in chat={chat} due_at={}",
+                    plan.due_now.due_at_utc
+                );
+                if let Err(err) = run_model_proactive_check_in(
+                    agent,
+                    transport,
+                    client,
+                    store.as_ref(),
+                    state,
+                    budget,
+                    chat,
+                    &path,
+                    &document,
+                    &plan,
+                    history_message_threshold,
+                )
+                .await
+                {
+                    eprintln!("[cadence-agent] proactive check-in failed for chat {chat}: {err}");
+                }
+            }
+            Ok(None) => {
+                if let Some(retry_at) = proactive_rate_limit_retry_at(&document, now, min_interval)
+                {
+                    next_due_at = Some(
+                        next_due_at
+                            .map_or(retry_at, |current: DateTime<Utc>| current.min(retry_at)),
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[cadence-agent] failed to plan proactive check-in for {}: {err}",
+                    path.display()
+                );
+            }
+        }
+
+        let next_document = load_document(&path).unwrap_or(document);
+        let now = Utc::now();
+        match next_proactive_due_at_after(&next_document, now, PROACTIVE_SCAN_HORIZON_DAYS) {
+            Ok(Some(due_at)) => {
+                next_due_at =
+                    Some(next_due_at.map_or(due_at, |current: DateTime<Utc>| current.min(due_at)));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "[cadence-agent] failed to find next proactive due time for {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    next_due_at
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_proactive_scheduler<T>(
+    agent: SharedCadenceAgent,
+    transport: T,
+    client: Anthropic,
+    store: Arc<dyn StateStore>,
+    state: Arc<AsyncMutex<TransportState>>,
+    budget: Arc<Budget>,
+    yaml_dir: PathBuf,
+    min_interval: ChronoDuration,
+    history_message_threshold: usize,
+    schedule_changed: Arc<Notify>,
+    interrupted: Arc<AtomicBool>,
+) where
+    T: ChatTransport + Sync,
+{
+    let mut pass = ProactivePass::Startup;
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let next_due_at = run_proactive_pass(
+            pass,
+            &agent,
+            &transport,
+            &client,
+            &store,
+            &state,
+            &budget,
+            &yaml_dir,
+            min_interval,
+            history_message_threshold,
+            &interrupted,
+        )
+        .await;
+
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let idle_rescan = StdDuration::from_secs(PROACTIVE_IDLE_RESCAN_SECS);
+        let now = Utc::now();
+        let (sleep_for, next_pass) = match next_due_at {
+            Some(due_at) => {
+                let until_due = due_at
+                    .signed_duration_since(now)
+                    .to_std()
+                    .unwrap_or(StdDuration::ZERO);
+                if until_due <= idle_rescan {
+                    (until_due, ProactivePass::Scheduled(due_at))
+                } else {
+                    (idle_rescan, ProactivePass::Startup)
+                }
+            }
+            None => (idle_rescan, ProactivePass::Startup),
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {
+                pass = next_pass;
+            }
+            _ = schedule_changed.notified() => {
+                pass = ProactivePass::Startup;
+            }
+        }
+    }
 }
 
 fn is_human_user_message(message: &MessageParam) -> bool {
@@ -2035,7 +2629,7 @@ fn user_yaml_pre_filter(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (options, _free) = CliOptions::from_command_line_relaxed(
-        "Usage: cadence-agent [--yaml DIR] [--model MODEL] [--import-request-log PATH] [--mutation-cap N] [--history-message-threshold N] [--stdin] [--state PATH]",
+        "Usage: cadence-agent [--yaml DIR] [--model MODEL] [--import-request-log PATH] [--mutation-cap N] [--history-message-threshold N] [--proactive-min-interval DURATION] [--stdin] [--state PATH]",
     );
 
     let history_message_threshold = options
@@ -2062,6 +2656,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_file_path = yaml_dir.join("0.yaml");
     let document: SharedDocument = Arc::new(Mutex::new(CadenceDocument::new("UTC")));
     let file_path: SharedFilePath = Arc::new(Mutex::new(initial_file_path));
+    let schedule_changed = Arc::new(Notify::new());
 
     let client = Anthropic::new(None)?;
 
@@ -2086,7 +2681,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&mutation_counter),
         Arc::clone(&file_path),
         config,
+        Some(Arc::clone(&schedule_changed)),
     );
+    let agent = SharedCadenceAgent::new(agent);
 
     let state_path = options
         .state
@@ -2145,13 +2742,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("[cadence-agent] allowed users: {allowed_count}");
 
-        let mut loop_config = LoopConfig::new(store, state, budget, interrupted);
+        let scheduler_handle = if options.disable_proactive_checkins {
+            eprintln!("[cadence-agent] proactive check-ins disabled");
+            None
+        } else {
+            let proactive_min_interval =
+                proactive_min_interval(options.proactive_min_interval.as_deref())?;
+            eprintln!(
+                "[cadence-agent] proactive check-ins enabled; min interval: {}s",
+                proactive_min_interval.num_seconds()
+            );
+            let proactive_transport =
+                TelegramTransport::new(token.clone(), Arc::clone(&state), Arc::clone(&store))?;
+            let proactive_client = Anthropic::new(None)?;
+            Some(tokio::spawn(run_proactive_scheduler(
+                agent.clone(),
+                proactive_transport,
+                proactive_client,
+                Arc::clone(&store),
+                Arc::clone(&state),
+                Arc::clone(&budget),
+                yaml_dir.clone(),
+                proactive_min_interval,
+                history_message_threshold,
+                Arc::clone(&schedule_changed),
+                Arc::clone(&interrupted),
+            )))
+        };
+
+        let mut loop_config = LoopConfig::new(
+            Arc::clone(&store),
+            Arc::clone(&state),
+            Arc::clone(&budget),
+            Arc::clone(&interrupted),
+        );
         loop_config.pre_filter = Some(user_yaml_pre_filter(
             yaml_dir, document, file_path, None, true,
         ));
         loop_config.max_history_messages = Some(history_message_threshold);
         loop_config.reset_on_context_limit = true;
-        run_agent_loop(agent, transport, client, loop_config).await?;
+        let loop_result = run_agent_loop(agent, transport, client, loop_config).await;
+        if let Some(handle) = scheduler_handle {
+            handle.abort();
+        }
+        loop_result?;
     }
 
     Ok(())
@@ -2171,5 +2805,47 @@ mod tests {
 
         assert!(content.contains("Current timestamp: 2026-05-02T12:34:56+00:00 (UTC)"));
         assert!(content.ends_with("\n\nreview my rhythms"));
+    }
+
+    #[test]
+    fn system_prompt_ignores_missing_personality_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cadence-agent-missing-personality-{}.yaml",
+            std::process::id()
+        ));
+
+        let prompt = build_system_prompt_for_yaml_path(&path);
+
+        assert_eq!(prompt, DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn system_prompt_appends_adjacent_personality_file() {
+        let base =
+            std::env::temp_dir().join(format!("cadence-agent-personality-{}", std::process::id()));
+        let yaml_path = base.with_extension("yaml");
+        let md_path = base.with_extension("md");
+        fs::write(&md_path, "Use short, direct replies.\n").unwrap();
+
+        let prompt = build_system_prompt_for_yaml_path(&yaml_path);
+
+        assert!(prompt.starts_with(DEFAULT_SYSTEM_PROMPT));
+        assert!(prompt.contains("<personality>\nUse short, direct replies.\n</personality>"));
+        fs::remove_file(md_path).unwrap();
+    }
+
+    #[test]
+    fn proactive_duration_parser_accepts_common_units() {
+        assert_eq!(parse_duration_seconds("30"), Ok(30));
+        assert_eq!(parse_duration_seconds("5m"), Ok(300));
+        assert_eq!(parse_duration_seconds("2 hours"), Ok(7200));
+        assert_eq!(parse_duration_seconds("1d"), Ok(86_400));
+    }
+
+    #[test]
+    fn proactive_duration_parser_rejects_unknown_units() {
+        assert!(parse_duration_seconds("").is_err());
+        assert!(parse_duration_seconds("soon").is_err());
+        assert!(parse_duration_seconds("1fortnight").is_err());
     }
 }
