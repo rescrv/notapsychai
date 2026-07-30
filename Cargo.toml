@@ -5,6 +5,7 @@ members = [
     "cadence",
     "labradormail",
     "orgremode",
+    "total-order-interview",
 ]
 
 [workspace.dependencies]

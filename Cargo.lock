@@ -3033,6 +3033,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "total-order-interview"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rustyline 17.0.2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
